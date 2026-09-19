@@ -29,7 +29,7 @@ describe("minimax probe contracts", () => {
       const path = join(directory, `${name}.json`);
       writeFileSync(
         path,
-        JSON.stringify({ minimax: { key: `synthetic-${name}` } }),
+        JSON.stringify({ minimax: { type: "api", key: `synthetic-${name}` } }),
       );
       return { name, path: () => path, extract };
     });
