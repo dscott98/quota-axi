@@ -484,7 +484,10 @@ type MinimaxPeriod = {
 function minimaxMeasurement(
   model: Record<string, unknown>,
   period: MinimaxPeriod,
-): Pick<QuotaWindow, "percentUsed" | "percentRemaining"> | "invalid" | undefined {
+):
+  | Pick<QuotaWindow, "percentUsed" | "percentRemaining">
+  | "invalid"
+  | undefined {
   const remainingPercent = numericValue(model[period.remainingPercent]);
   if (remainingPercent !== undefined) {
     if (remainingPercent < 0 || remainingPercent > 100) return "invalid";
@@ -504,7 +507,9 @@ function minimaxMeasurement(
     total <= 0 ||
     (usage !== undefined && (usage < 0 || usage > total)) ||
     (remaining !== undefined && (remaining < 0 || remaining > total)) ||
-    (usage !== undefined && remaining !== undefined && usage + remaining !== total)
+    (usage !== undefined &&
+      remaining !== undefined &&
+      usage + remaining !== total)
   )
     return "invalid";
 
