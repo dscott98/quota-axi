@@ -423,7 +423,7 @@ function normalizeMinimaxProbe(raw: unknown): NormalizedMinimaxProbe {
         total: "current_interval_total_count",
         usage: "current_interval_usage_count",
         remaining: "current_interval_remain_count",
-        resetsAt: "current_interval_end_time",
+        resetsAt: ["end_time", "current_interval_end_time"],
         remainsTime: "remains_time",
       },
       {
@@ -434,7 +434,7 @@ function normalizeMinimaxProbe(raw: unknown): NormalizedMinimaxProbe {
         total: "current_weekly_total_count",
         usage: "current_weekly_usage_count",
         remaining: "current_weekly_remain_count",
-        resetsAt: "weekly_end_time",
+        resetsAt: ["weekly_end_time"],
         remainsTime: "weekly_remains_time",
       },
     ]) {
@@ -445,7 +445,11 @@ function normalizeMinimaxProbe(raw: unknown): NormalizedMinimaxProbe {
         continue;
       }
       if (!measurement) continue;
-      const resetsAt = parseEpochOrIso(model[period.resetsAt]);
+      const resetsAt = parseEpochOrIso(
+        period.resetsAt
+          .map((field) => model[field])
+          .find((value) => value != null),
+      );
       const resetText = remainsText(model[period.remainsTime]);
       windows.push({
         id,
@@ -473,7 +477,7 @@ type MinimaxPeriod = {
   total: string;
   usage: string;
   remaining: string;
-  resetsAt: string;
+  resetsAt: readonly string[];
   remainsTime: string;
 };
 
