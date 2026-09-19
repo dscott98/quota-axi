@@ -164,14 +164,14 @@ function semanticsFor(
         generatedAt,
       );
     case "minimax":
-    case "openrouter":
-      // MiniMax and OpenRouter report auth usability but no first-party quota
-      // windows, so there is nothing for the semantics layer to bind. Their
-      // provider adapters already publish the truthful `authStatus: usable`
-      // and `credits` (`openrouter` when `data.limit` is set) signals.
       return unknownSemantics(
         provider.windows,
-        `${provider.label ?? provider.provider} does not publish per-window reset or bound evidence, so quota-axi reports the credentials and credits it observed but no effective remaining percentage.`,
+        "MiniMax reports per-model Coding Plan meters, but does not establish whether those meters are independent or jointly bound, so quota-axi does not claim an effective remaining percentage.",
+      );
+    case "openrouter":
+      return unknownSemantics(
+        provider.windows,
+        "OpenRouter does not publish per-window reset or bound evidence, so quota-axi reports the credentials and credits it observed but no effective remaining percentage.",
       );
   }
 }

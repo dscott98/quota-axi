@@ -1,15 +1,14 @@
 /**
  * MiniMax (minimax) provider adapter.
  *
- * MiniMax exposes no first-party quota or billing endpoint, so this adapter's
- * truthful reading is bounded to auth usability. A successful no-cost probe
- * against `https://api.MiniMax.chat/v1/models` confirms the key still authorises
- * the account; quota figures are not invented beyond that.
+ * MiniMax's Coding Plan remains endpoint reports the vendor's current
+ * time- or count-metered allowance. The adapter publishes only its supplied
+ * percentages and counter-derived values; it never calls inference.
  *
  * It honours the smallest opt-in surface agreed in the package:
  *  - `$MINIMAX_API_KEY` first (explicit caller intent).
- *  - opencode `auth.json` `minimax` / `MiniMax` literal key entry.
- *  - Pi's `$PI_CODING_AGENT_DIR/auth.json` `minimax` / `MiniMax` entry.
+ *  - opencode `auth.json` `minimax`, `MiniMax`, or `minimax-coding-plan`.
+ *  - Pi's `$PI_CODING_AGENT_DIR/auth.json` under those same ids.
  *
  * Nothing else is read or written. The adapter never refreshes credentials,
  * never calls inference, and never derives a quota percentage from model
@@ -22,6 +21,7 @@ import { classifyPiAuthEntry } from "../lib/pi-auth-store.js";
 import { usableLiteralSecret } from "../lib/secret.js";
 import { readJsonFileResult, type JsonFileReadResult } from "../lib/fs.js";
 import { resolvePiAuthFilePath } from "../lib/pi-agent-dir.js";
+import { parseEpochOrIso } from "../lib/time.js";
 import { withUsageFetchFailure } from "./usage-fetch-failure.js";
 import { failedProvider, sourceNames, successProvider } from "./common.js";
 import type {
@@ -30,16 +30,17 @@ import type {
   ProviderAdapter,
   ProviderOptions,
   ProviderQuota,
+  QuotaWindow,
   SourceAttempt,
 } from "../types.js";
 
 const LABEL = "MiniMax";
 const OPERATION_DEADLINE_MS = 15_000;
 const RESPONSE_LIMIT_BYTES = 262_144;
-const MINIMAX_HOST = "api.MiniMax.chat";
-const MINIMAX_PROBE_PATH = "/v1/models";
+const MINIMAX_HOST = "api.minimax.io";
+const MINIMAX_PROBE_PATH = "/v1/api/openplatform/coding_plan/remains";
 
-const MINIMAX_PROVIDER_IDS = ["minimax", "MiniMax"];
+const MINIMAX_PROVIDER_IDS = ["minimax", "MiniMax", "minimax-coding-plan"];
 const MINIMAX_CREDENTIAL_KEYS = [
   "key",
   "apiKey",
@@ -196,6 +197,8 @@ type MinimaxDependencies = {
 
 export type NormalizedMinimaxProbe = {
   accountLabel?: string;
+  windows: QuotaWindow[];
+  untrustedWindowIds: string[];
 };
 
 export function createMinimaxAdapter(
@@ -362,6 +365,17 @@ async function probeMinimax(
     } catch {
       throw new Error("malformed_json");
     }
+    const baseResponse = objectValue(objectValue(payload)?.base_resp);
+    if (numericValue(baseResponse?.status_code) !== undefined) {
+      const statusCode = numericValue(baseResponse?.status_code)!;
+      if (statusCode !== 0) {
+        throw new Error(
+          statusCode === 1004
+            ? "provider_auth_rejected"
+            : "provider_request_rejected",
+        );
+      }
+    }
     return normalizeMinimaxProbe(payload);
   } catch (error) {
     if (controller.signal.aborted) {
@@ -388,10 +402,134 @@ async function probeMinimax(
 
 function normalizeMinimaxProbe(raw: unknown): NormalizedMinimaxProbe {
   const root = objectValue(raw);
-  if (!root) return {};
+  if (!root) return { windows: [], untrustedWindowIds: [] };
   const data = objectValue(root.data) ?? root;
   const label = firstString(data, ["label", "name", "username"]);
-  return { ...(label ? { accountLabel: label } : {}) };
+  const models = Array.isArray(data.model_remains) ? data.model_remains : [];
+  const windows: QuotaWindow[] = [];
+  const untrustedWindowIds: string[] = [];
+
+  for (const [index, candidate] of models.entries()) {
+    const model = objectValue(candidate);
+    if (!model) continue;
+    const name = stringValue(model.model_name) ?? `${index + 1}`;
+    const prefix = `model:${name}`;
+    for (const period of [
+      {
+        id: "interval",
+        label: "interval",
+        kind: "session" as const,
+        remainingPercent: "current_interval_remaining_percent",
+        total: "current_interval_total_count",
+        usage: "current_interval_usage_count",
+        remaining: "current_interval_remain_count",
+        resetsAt: "current_interval_end_time",
+        remainsTime: "remains_time",
+      },
+      {
+        id: "weekly",
+        label: "weekly",
+        kind: "weekly" as const,
+        remainingPercent: "current_weekly_remaining_percent",
+        total: "current_weekly_total_count",
+        usage: "current_weekly_usage_count",
+        remaining: "current_weekly_remain_count",
+        resetsAt: "weekly_end_time",
+        remainsTime: "weekly_remains_time",
+      },
+    ]) {
+      const id = `${prefix}:${period.id}`;
+      const measurement = minimaxMeasurement(model, period);
+      if (measurement === "invalid") {
+        untrustedWindowIds.push(id);
+        continue;
+      }
+      if (!measurement) continue;
+      const resetsAt = parseEpochOrIso(model[period.resetsAt]);
+      const resetText = remainsText(model[period.remainsTime]);
+      windows.push({
+        id,
+        label: `${name} ${period.label}`,
+        kind: period.kind,
+        ...measurement,
+        ...(resetsAt ? { resetsAt } : {}),
+        ...(resetText ? { resetText } : {}),
+      });
+    }
+  }
+
+  return {
+    ...(label ? { accountLabel: label } : {}),
+    windows,
+    untrustedWindowIds,
+  };
+}
+
+type MinimaxPeriod = {
+  id: string;
+  label: string;
+  kind: "session" | "weekly";
+  remainingPercent: string;
+  total: string;
+  usage: string;
+  remaining: string;
+  resetsAt: string;
+  remainsTime: string;
+};
+
+function minimaxMeasurement(
+  model: Record<string, unknown>,
+  period: MinimaxPeriod,
+): Pick<QuotaWindow, "percentUsed" | "percentRemaining"> | "invalid" | undefined {
+  const remainingPercent = numericValue(model[period.remainingPercent]);
+  if (remainingPercent !== undefined) {
+    if (remainingPercent < 0 || remainingPercent > 100) return "invalid";
+    return {
+      percentUsed: 100 - remainingPercent,
+      percentRemaining: remainingPercent,
+    };
+  }
+
+  const total = numericValue(model[period.total]);
+  const usage = numericValue(model[period.usage]);
+  const remaining = numericValue(model[period.remaining]);
+  if (total === undefined && usage === undefined && remaining === undefined)
+    return undefined;
+  if (
+    total === undefined ||
+    total <= 0 ||
+    (usage !== undefined && (usage < 0 || usage > total)) ||
+    (remaining !== undefined && (remaining < 0 || remaining > total)) ||
+    (usage !== undefined && remaining !== undefined && usage + remaining !== total)
+  )
+    return "invalid";
+
+  const rawUsed = usage ?? total - remaining!;
+  const rawRemaining = remaining ?? total - usage!;
+  const percentUsed = (rawUsed / total) * 100;
+  const percentRemaining = (rawRemaining / total) * 100;
+  if (percentUsed + percentRemaining !== 100) return "invalid";
+  return { percentUsed, percentRemaining };
+}
+
+function remainsText(value: unknown): string | undefined {
+  const seconds = numericValue(value);
+  if (seconds === undefined || seconds < 0) return undefined;
+  const totalMinutes = Math.floor(seconds / 60);
+  const days = Math.floor(totalMinutes / (24 * 60));
+  const hours = Math.floor((totalMinutes % (24 * 60)) / 60);
+  const minutes = totalMinutes % 60;
+  const parts = [
+    ...(days > 0 ? [`${days}d`] : []),
+    ...(hours > 0 ? [`${hours}h`] : []),
+    ...(minutes > 0 ? [`${minutes}m`] : []),
+  ];
+  return `${parts.length > 0 ? parts.join(" ") : "0m"} remaining`;
+}
+
+function numericValue(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+  return value;
 }
 
 function successMinimaxReport(
@@ -404,7 +542,7 @@ function successMinimaxReport(
     label: LABEL,
     source: "api",
     ...(probe.accountLabel ? { plan: probe.accountLabel } : {}),
-    windows: [],
+    windows: probe.windows,
     refreshedAt: new Date(dependencies.now()).toISOString(),
     sourcesTried: sourceNames(attempts),
     attempts,
@@ -414,6 +552,9 @@ function successMinimaxReport(
     state: {
       ...base.state,
       authStatus: "usable",
+      ...(probe.untrustedWindowIds.length > 0
+        ? { untrustedWindowIds: probe.untrustedWindowIds }
+        : {}),
     },
   };
 }
