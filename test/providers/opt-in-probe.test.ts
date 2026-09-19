@@ -127,6 +127,92 @@ describe.each([
     ]);
   });
 
+  it.each(["before", "after"])(
+    "preserves an unreadable store %s a credential rejection",
+    async (order) => {
+      const [rejected] = sources();
+      const unreadable = { name: "unreadable", path: () => directory, extract };
+      const missing = {
+        name: "missing",
+        path: () => join(directory, "absent.json"),
+        extract,
+      };
+      const fetch = vi.fn(async () => new Response("", { status: 401 }));
+      const report = await create({
+        envApiKey: () => undefined,
+        credentialSources:
+          order === "before"
+            ? [unreadable, rejected!, missing]
+            : [rejected!, unreadable, missing],
+        fetch,
+      }).fetchQuota(OPTIONS);
+      expect(fetch).toHaveBeenCalledOnce();
+      expect(report.state).toMatchObject({
+        status: "error",
+        error: "credential_resolution_failed: file_read_error",
+      });
+      expect(report.attempts).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            source: "unreadable",
+            status: "failed",
+            error: "credential_resolution_failed: file_read_error",
+          }),
+          expect.objectContaining({
+            source: "primary",
+            status: "failed",
+            error: "provider_auth_rejected",
+          }),
+        ]),
+      );
+    },
+  );
+
+  it("allows a healthy sibling to supersede an unreadable store", async () => {
+    const report = await create({
+      envApiKey: () => undefined,
+      credentialSources: [
+        { name: "unreadable", path: () => directory, extract },
+        ...sources(),
+      ],
+      fetch: vi.fn(async () => new Response("{}")),
+    }).fetchQuota(OPTIONS);
+    expect(report.state.authStatus).toBe("usable");
+    expect(report.attempts).toMatchObject([
+      { source: "unreadable", status: "failed" },
+      { source: "primary", status: "success" },
+    ]);
+  });
+
+  it.each([
+    [401, "provider_auth_rejected"],
+    [403, "provider_auth_rejected"],
+    [429, "provider_rate_limited"],
+    [503, "provider_request_rejected"],
+    [302, "provider_request_rejected"],
+  ] as const)(
+    "aborts streaming HTTP %i without changing its verdict",
+    async (status, error) => {
+      let signal: AbortSignal | null | undefined;
+      const aborted = vi.fn();
+      const response = new Response(new ReadableStream(), { status });
+      const fetch: typeof globalThis.fetch = async (_input, init) => {
+        signal = init?.signal;
+        signal?.addEventListener("abort", aborted, { once: true });
+        return response;
+      };
+      const report = await create({
+        envApiKey: () => "synthetic-env",
+        credentialSources: [],
+        fetch,
+      }).fetchQuota(OPTIONS);
+      expect(report.state.error).toBe(error);
+      expect(signal?.aborted).toBe(true);
+      expect(aborted).toHaveBeenCalledOnce();
+      await response.body?.cancel();
+    },
+  );
+
   it("uses the shared transport by default", async () => {
     vi.mocked(providerFetch).mockResolvedValue(new Response("{}"));
     const report = await create({
