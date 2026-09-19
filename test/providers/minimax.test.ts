@@ -189,6 +189,38 @@ describe("MiniMax provider", () => {
     });
   });
 
+  it.each(["label", "name", "username"])(
+    "does not interpret account %s as a plan",
+    async (field) => {
+      const report = await createMinimaxAdapter({
+        envApiKey: () => KEY,
+        credentialSources: [],
+        fetch: async () =>
+          jsonResponse({
+            data: {
+              [field]: "synthetic-account-name",
+              model_remains: [
+                {
+                  model_name: "general",
+                  current_interval_total_count: 100,
+                  current_interval_usage_count: 75,
+                },
+              ],
+            },
+          }),
+      }).fetchQuota(OPTIONS);
+      expect(report.plan).toBeUndefined();
+      expect(JSON.stringify(report)).not.toContain("synthetic-account-name");
+      expect(report.windows).toMatchObject([
+        {
+          id: "model:general:interval",
+          percentUsed: 25,
+          percentRemaining: 75,
+        },
+      ]);
+    },
+  );
+
   it("retains seconds-epoch current_interval_end_time as an end_time alias", async () => {
     process.env.MINIMAX_API_KEY = KEY;
     const report = await createMinimaxAdapter({
