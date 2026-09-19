@@ -179,7 +179,6 @@ type MinimaxDependencies = {
 };
 
 export type NormalizedMinimaxProbe = {
-  accountLabel?: string;
   windows: QuotaWindow[];
   untrustedWindowIds: string[];
 };
@@ -383,7 +382,6 @@ function normalizeMinimaxProbe(raw: unknown): NormalizedMinimaxProbe {
   const root = objectValue(raw);
   if (!root) return { windows: [], untrustedWindowIds: [] };
   const data = objectValue(root.data) ?? root;
-  const label = firstString(data, ["label", "name", "username"]);
   const models = Array.isArray(data.model_remains) ? data.model_remains : [];
   const windows: QuotaWindow[] = [];
   const untrustedWindowIds: string[] = [];
@@ -442,7 +440,6 @@ function normalizeMinimaxProbe(raw: unknown): NormalizedMinimaxProbe {
   }
 
   return {
-    ...(label ? { accountLabel: label } : {}),
     windows,
     untrustedWindowIds,
   };
@@ -536,7 +533,6 @@ function successMinimaxReport(
     provider: "minimax",
     label: LABEL,
     source: "api",
-    ...(probe.accountLabel ? { plan: probe.accountLabel } : {}),
     windows: probe.windows,
     refreshedAt: new Date(dependencies.now()).toISOString(),
     sourcesTried: sourceNames(attempts),
@@ -635,16 +631,4 @@ function objectValue(value: unknown): Record<string, unknown> | undefined {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
-}
-
-function firstString(
-  value: Record<string, unknown>,
-  keys: readonly string[],
-): string | undefined {
-  return keys
-    .map((key) => {
-      const raw = value[key];
-      return typeof raw === "string" && raw.trim() ? raw.trim() : undefined;
-    })
-    .find((entry): entry is string => entry !== undefined);
 }
