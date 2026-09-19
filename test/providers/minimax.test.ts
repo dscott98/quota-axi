@@ -1,4 +1,10 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -11,6 +17,9 @@ import {
 
 const OPTIONS = { allowKeychainPrompt: false, refreshCredentials: false };
 const KEY = "synthetic-minimax-key-42";
+const CODING_PLAN_REMAINS = JSON.parse(
+  readFileSync("test/fixtures/minimax/coding-plan-remains.json", "utf8"),
+) as unknown;
 
 const ENV_KEYS = [
   "XDG_DATA_HOME",
@@ -78,6 +87,12 @@ describe("MiniMax provider", () => {
     ).toEqual({ status: "available", apiKey: KEY, path: "/auth.json" });
     expect(
       extractMinimaxCredential(
+        { "minimax-coding-plan": { type: "api", key: KEY } },
+        "/auth.json",
+      ),
+    ).toEqual({ status: "available", apiKey: KEY, path: "/auth.json" });
+    expect(
+      extractMinimaxCredential(
         { minimax: { type: "api", api_key: KEY } },
         "/auth.json",
       ),
@@ -107,7 +122,7 @@ describe("MiniMax provider", () => {
     );
 
     expect(String(request.mock.calls[0]?.[0])).toBe(
-      "https://api.MiniMax.chat/v1/models",
+      "https://api.minimax.io/v1/api/openplatform/coding_plan/remains",
     );
     expect(
       new Headers(request.mock.calls[0]?.[1]?.headers).get("authorization"),
@@ -119,6 +134,136 @@ describe("MiniMax provider", () => {
       state: { status: "fresh", stale: false, authStatus: "usable" },
     });
     expect(JSON.stringify(report)).not.toContain(KEY);
+  });
+
+  it("reads time-metered Coding Plan windows from the canonical remains endpoint", async () => {
+    process.env.MINIMAX_API_KEY = KEY;
+    const request = vi.fn(async () => jsonResponse(CODING_PLAN_REMAINS));
+
+    const report = await createMinimaxAdapter({ fetch: request }).fetchQuota(
+      OPTIONS,
+    );
+
+    expect(String(request.mock.calls[0]?.[0])).toBe(
+      "https://api.minimax.io/v1/api/openplatform/coding_plan/remains",
+    );
+    expect(report).toMatchObject({
+      windows: [
+        {
+          id: "model:general:interval",
+          kind: "session",
+          percentUsed: 27,
+          percentRemaining: 73,
+          resetsAt: "2025-10-09T09:00:00.000Z",
+          resetText: "59m remaining",
+        },
+        {
+          id: "model:general:weekly",
+          kind: "weekly",
+          percentUsed: 3,
+          percentRemaining: 97,
+          resetsAt: "2025-10-14T00:00:00.000Z",
+          resetText: "1d 20h remaining",
+        },
+      ],
+      state: { status: "fresh", authStatus: "usable" },
+    });
+  });
+
+  it("supports count-metered Coding Plans when vendor percentages are absent", async () => {
+    process.env.MINIMAX_API_KEY = KEY;
+    const report = await createMinimaxAdapter({
+      fetch: vi.fn(async () =>
+        jsonResponse({
+          model_remains: [
+            {
+              model_name: "general",
+              current_interval_total_count: 100,
+              current_interval_usage_count: 25,
+              current_weekly_total_count: 200,
+              current_weekly_usage_count: 50,
+            },
+          ],
+        }),
+      ),
+    }).fetchQuota(OPTIONS);
+
+    expect(report.windows).toMatchObject([
+      {
+        id: "model:general:interval",
+        percentUsed: 25,
+        percentRemaining: 75,
+      },
+      {
+        id: "model:general:weekly",
+        percentUsed: 25,
+        percentRemaining: 75,
+      },
+    ]);
+  });
+
+  it("rejects vendor-encoded authentication failures and untrusted raw counters", async () => {
+    process.env.MINIMAX_API_KEY = KEY;
+    const rejected = await createMinimaxAdapter({
+      fetch: vi.fn(async () =>
+        jsonResponse({
+          base_resp: { status_code: 1004, status_msg: "cookie is missing" },
+        }),
+      ),
+    }).fetchQuota(OPTIONS);
+    expect(rejected.state).toMatchObject({
+      status: "auth_required",
+      error: "provider_auth_rejected",
+    });
+
+    const transport = await createMinimaxAdapter({
+      fetch: vi.fn(async () =>
+        jsonResponse({ base_resp: { status_code: 2001 } }),
+      ),
+    }).fetchQuota(OPTIONS);
+    expect(transport.state).toMatchObject({
+      status: "error",
+      error: "provider_request_rejected",
+    });
+
+    const report = await createMinimaxAdapter({
+      fetch: vi.fn(async () =>
+        jsonResponse({
+          model_remains: [
+            {
+              model_name: "general",
+              current_interval_total_count: 100,
+              current_interval_usage_count: 150,
+              current_interval_remain_count: 0,
+            },
+            {
+              model_name: "video",
+              current_interval_total_count: 100,
+              current_interval_usage_count: 50,
+              current_interval_remain_count: 40,
+              current_weekly_total_count: 100,
+              current_weekly_usage_count: 0,
+              current_weekly_remain_count: 101,
+            },
+          ],
+        }),
+      ),
+    }).fetchQuota(OPTIONS);
+    expect(report.windows).toEqual([]);
+    expect(report.state.untrustedWindowIds).toEqual([
+      "model:general:interval",
+      "model:video:interval",
+      "model:video:weekly",
+    ]);
+  });
+
+  it("recognizes the canonical opencode Coding Plan credential id", async () => {
+    writeOpencodeAuth({ "minimax-coding-plan": { key: KEY } });
+    const request = vi.fn(async () => jsonResponse({ model_remains: [] }));
+
+    await createMinimaxAdapter({ fetch: request }).fetchQuota(OPTIONS);
+
+    expect(request).toHaveBeenCalledOnce();
   });
 
   it("honours MINIMAX_API_KEY ahead of the configured stores", async () => {
