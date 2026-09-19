@@ -517,9 +517,9 @@ function minimaxMeasurement(
 }
 
 function remainsText(value: unknown): string | undefined {
-  const seconds = numericValue(value);
-  if (seconds === undefined || seconds < 0) return undefined;
-  const totalMinutes = Math.floor(seconds / 60);
+  const milliseconds = numericValue(value);
+  if (milliseconds === undefined || milliseconds < 0) return undefined;
+  const totalMinutes = Math.floor(milliseconds / (60 * 1000));
   const days = Math.floor(totalMinutes / (24 * 60));
   const hours = Math.floor((totalMinutes % (24 * 60)) / 60);
   const minutes = totalMinutes % 60;
