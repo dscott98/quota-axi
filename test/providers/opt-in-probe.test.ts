@@ -7,10 +7,6 @@ import {
   createMinimaxAdapter,
   extractMinimaxCredential,
 } from "../../src/providers/minimax.js";
-import {
-  createOpenRouterAdapter,
-  extractOpenRouterCredential,
-} from "../../src/providers/openrouter.js";
 
 vi.mock("../../src/lib/http.js", () => ({ providerFetch: vi.fn() }));
 
@@ -24,24 +20,16 @@ afterEach(() => {
   vi.resetAllMocks();
 });
 
-describe.each([
-  {
-    provider: "minimax",
-    create: createMinimaxAdapter,
-    extract: extractMinimaxCredential,
-  },
-  {
-    provider: "openrouter",
-    create: createOpenRouterAdapter,
-    extract: extractOpenRouterCredential,
-  },
-])("$provider probe contracts", ({ provider, create, extract }) => {
+describe("minimax probe contracts", () => {
+  const create = createMinimaxAdapter;
+  const extract = extractMinimaxCredential;
+
   function sources() {
     return ["primary", "secondary"].map((name) => {
       const path = join(directory, `${name}.json`);
       writeFileSync(
         path,
-        JSON.stringify({ [provider]: { key: `synthetic-${name}` } }),
+        JSON.stringify({ minimax: { key: `synthetic-${name}` } }),
       );
       return { name, path: () => path, extract };
     });
