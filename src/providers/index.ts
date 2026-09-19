@@ -9,7 +9,6 @@ import { grokAdapter } from "./grok.js";
 import { kimiAdapter } from "./kimi.js";
 import { minimaxAdapter } from "./minimax.js";
 import { opencodeGoAdapter } from "./opencode-go.js";
-import { openrouterAdapter } from "./openrouter.js";
 import { zaiAdapter } from "./zai.js";
 import {
   DEFAULT_PROVIDER_IDS,
@@ -31,14 +30,12 @@ export const PROVIDERS: Record<ProviderId, ProviderAdapter> = {
   "opencode-go": opencodeGoAdapter,
   commandcode: commandCodeAdapter,
   minimax: minimaxAdapter,
-  openrouter: openrouterAdapter,
 };
 
 export function parseProviders(value: string | undefined): ProviderId[] {
   // No `--provider` selector: stick to the explicit default list so opt-in
-  // adapters (`minimax`, `openrouter`) never appear in a default probe. They
-  // still validate against {@link PROVIDER_IDS} so an explicit selector can
-  // name them.
+  // adapters (`minimax`) never appear in a default probe. They still validate
+  // against {@link PROVIDER_IDS} so an explicit selector can name them.
   if (!value) return [...DEFAULT_PROVIDER_IDS];
   const providers = value
     .split(",")

@@ -26,7 +26,6 @@ const originalAlibabaProvider = PROVIDERS.alibaba;
 const originalOpenCodeGoProvider = PROVIDERS["opencode-go"];
 const originalCommandCodeProvider = PROVIDERS.commandcode;
 const originalMinimaxProvider = PROVIDERS.minimax;
-const originalOpenRouterProvider = PROVIDERS.openrouter;
 const originalXdgCacheHome = process.env.XDG_CACHE_HOME;
 const originalClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR;
 const originalCodexHome = process.env.CODEX_HOME;
@@ -45,7 +44,6 @@ afterEach(() => {
   PROVIDERS["opencode-go"] = originalOpenCodeGoProvider;
   PROVIDERS.commandcode = originalCommandCodeProvider;
   PROVIDERS.minimax = originalMinimaxProvider;
-  PROVIDERS.openrouter = originalOpenRouterProvider;
   if (originalXdgCacheHome === undefined) delete process.env.XDG_CACHE_HOME;
   else process.env.XDG_CACHE_HOME = originalXdgCacheHome;
   if (originalClaudeConfigDir === undefined)
@@ -79,16 +77,13 @@ describe("CLI flag parsing", () => {
   it("keeps opt-in providers out of the default probe list", () => {
     const defaults = parseFlags([]).providers;
     expect(defaults).not.toContain("minimax");
-    expect(defaults).not.toContain("openrouter");
     expect(parseFlags(["--provider", "minimax"]).providers).toEqual([
       "minimax",
     ]);
-    expect(parseFlags(["--provider", "openrouter"]).providers).toEqual([
-      "openrouter",
+    expect(parseFlags(["--provider=claude,minimax"]).providers).toEqual([
+      "claude",
+      "minimax",
     ]);
-    expect(
-      parseFlags(["--provider=claude,minimax,openrouter"]).providers,
-    ).toEqual(["claude", "minimax", "openrouter"]);
   });
 
   it("scopes comma-separated providers", () => {
