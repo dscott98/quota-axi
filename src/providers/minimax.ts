@@ -7,8 +7,8 @@
  *
  * It honours the smallest opt-in surface agreed in the package:
  *  - `$MINIMAX_API_KEY` first (explicit caller intent).
- *  - opencode `auth.json` `minimax`, `MiniMax`, or `minimax-coding-plan`.
- *  - Pi's `$PI_CODING_AGENT_DIR/auth.json` under those same ids.
+ *  - opencode `auth.json` `minimax` or `minimax-coding-plan`.
+ *  - Pi's `$PI_CODING_AGENT_DIR/auth.json` under `minimax`.
  *
  * Nothing else is read or written. The adapter never refreshes credentials,
  * never calls inference, and never derives a quota percentage from model
@@ -43,13 +43,13 @@ const RESPONSE_LIMIT_BYTES = 262_144;
 const MINIMAX_HOST = "api.minimax.io";
 const MINIMAX_PROBE_PATH = "/v1/api/openplatform/coding_plan/remains";
 
-const MINIMAX_PROVIDER_IDS = ["minimax", "MiniMax", "minimax-coding-plan"];
+const OPENCODE_MINIMAX_IDS = ["minimax", "minimax-coding-plan"];
 const ENV_MINIMAX_API_KEY = "MINIMAX_API_KEY";
 const OPENCODE_AUTH_SOURCE = "opencode:auth.json";
 const PI_MINIMAX_SOURCE = "pi:minimax";
 
 export type MinimaxCredentialResolution =
-  | { status: "available"; apiKey: string; path: string }
+  | { status: "available"; apiKeys: string[]; path: string }
   | { status: "missing"; path: string }
   | { status: "invalid"; path: string; error: string }
   | { status: "error"; path: string; error: string };
@@ -77,13 +77,15 @@ export function extractMinimaxCredential(
   const data = objectValue(value);
   if (!data) return { status: "invalid", path, error: "json_parse_error" };
   let presentEntry = false;
-  for (const providerId of MINIMAX_PROVIDER_IDS) {
+  const apiKeys: string[] = [];
+  for (const providerId of OPENCODE_MINIMAX_IDS) {
     const entry = data[providerId];
     if (entry === undefined || entry === null) continue;
     presentEntry = true;
     const key = extractCredentialKey(entry);
-    if (key) return { status: "available", apiKey: key, path };
+    if (key) apiKeys.push(key);
   }
+  if (apiKeys.length > 0) return { status: "available", apiKeys, path };
   if (presentEntry)
     return { status: "invalid", path, error: "invalid_credential" };
   return { status: "missing", path };
@@ -93,22 +95,19 @@ function extractPiMinimaxCredential(
   value: unknown,
   path: string,
 ): MinimaxCredentialResolution {
-  for (const providerId of MINIMAX_PROVIDER_IDS) {
-    const classified = classifyPiAuthEntry(value, providerId);
-    if (classified.status === "missing") continue;
-    if (classified.status === "invalid") {
-      return { status: "invalid", path, error: "pi_entry_invalid" };
-    }
-    const entry = classified.entry;
-    const type = entryType(entry);
-    if (type === "api_key") {
-      const key = usableLiteralSecret(entry.key);
-      if (key) return { status: "available", apiKey: key, path };
-      return { status: "invalid", path, error: "invalid_credential" };
-    }
+  const classified = classifyPiAuthEntry(value, "minimax");
+  if (classified.status === "missing") return { status: "missing", path };
+  if (classified.status === "invalid") {
+    return { status: "invalid", path, error: "pi_entry_invalid" };
+  }
+  const entry = classified.entry;
+  if (entryType(entry) !== "api_key") {
     return { status: "invalid", path, error: "unsupported_entry_type" };
   }
-  return { status: "missing", path };
+  const key = usableLiteralSecret(entry.key);
+  return key
+    ? { status: "available", apiKeys: [key], path }
+    : { status: "invalid", path, error: "invalid_credential" };
 }
 
 function entryType(entry: Record<string, unknown>): string | undefined {
@@ -216,12 +215,16 @@ async function fetchQuotaWithDependencies(
   let readError: string | undefined;
   let lastError: string | undefined;
 
-  async function tryCredential(
+  async function tryCredentials(
     source: string,
-    apiKey: string,
+    apiKeys: string[],
   ): Promise<ProviderQuota | undefined> {
     const selection = await selectCredential(
-      [{ source, credential: apiKey, localState: "valid" }],
+      apiKeys.map((credential) => ({
+        source,
+        credential,
+        localState: "valid" as const,
+      })),
       async (candidate) => {
         try {
           return {
@@ -237,12 +240,18 @@ async function fetchQuotaWithDependencies(
         }
       },
     );
+    for (const result of selection.results) {
+      if (result.outcome === "not_tried") continue;
+      attempts.push({
+        source,
+        status: result.outcome === "quota" ? "success" : "failed",
+        ...(result.error ? { error: result.error } : {}),
+      });
+    }
     if (selection.outcome === "quota") {
-      attempts.push({ source, status: "success" });
       return successMinimaxReport(selection.result!, attempts, dependencies);
     }
     const code = selection.transientError ?? selection.results[0]!.error!;
-    attempts.push({ source, status: "failed", error: code });
     if (selection.outcome === "transient") {
       return failedMinimaxReport(attempts, code);
     }
@@ -254,7 +263,7 @@ async function fetchQuotaWithDependencies(
 
   const envKey = usableLiteralSecret(dependencies.envApiKey());
   if (envKey) {
-    const report = await tryCredential(ENV_MINIMAX_API_KEY, envKey);
+    const report = await tryCredentials(ENV_MINIMAX_API_KEY, [envKey]);
     if (report) return report;
   }
 
@@ -282,7 +291,7 @@ async function fetchQuotaWithDependencies(
       continue;
     }
 
-    const report = await tryCredential(source.name, resolution.apiKey);
+    const report = await tryCredentials(source.name, resolution.apiKeys);
     if (report) return report;
   }
 
