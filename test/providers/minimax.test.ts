@@ -1,1057 +1,270 @@
-import {
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  createMiniMaxAdapter,
-  extractMiniMaxCliCredentials,
-  extractMiniMaxCredential,
-  normalizeMiniMaxPayload,
-  resolveMiniMaxCredentials,
+  createMinimaxAdapter,
+  defaultMinimaxCredentialSources,
+  extractMinimaxCredential,
+  opencodeAuthFilePath,
 } from "../../src/providers/minimax.js";
-import { withQuotaSemantics } from "../../src/interpretation.js";
 
 const OPTIONS = { allowKeychainPrompt: false, refreshCredentials: false };
 const KEY = "synthetic-minimax-key-42";
-const fixture = (name: string): unknown =>
-  JSON.parse(readFileSync(`test/fixtures/minimax/${name}.json`, "utf8"));
+
+const ENV_KEYS = [
+  "XDG_DATA_HOME",
+  "LOCALAPPDATA",
+  "PI_CODING_AGENT_DIR",
+  "MINIMAX_API_KEY",
+] as const;
+const originalEnv = Object.fromEntries(
+  ENV_KEYS.map((key) => [key, process.env[key]]),
+);
+let tempDir: string;
+
+beforeEach(() => {
+  tempDir = mkdtempSync(join(tmpdir(), "quota-axi-minimax-"));
+  process.env.XDG_DATA_HOME = join(tempDir, "data");
+  process.env.PI_CODING_AGENT_DIR = join(tempDir, "pi-agent");
+  delete process.env.MINIMAX_API_KEY;
+  if (process.platform === "win32")
+    process.env.LOCALAPPDATA = join(tempDir, "local");
+});
+
+afterEach(() => {
+  for (const key of ENV_KEYS) {
+    const value = originalEnv[key];
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  rmSync(tempDir, { recursive: true, force: true });
+  vi.useRealTimers();
+});
+
+function writePiStore(value: unknown): void {
+  const dir = process.env.PI_CODING_AGENT_DIR!;
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "auth.json"), JSON.stringify(value), { mode: 0o600 });
+}
+
+function writeOpencodeAuth(value: unknown): void {
+  mkdirSync(join(process.env.XDG_DATA_HOME!, "opencode"), {
+    recursive: true,
+  });
+  writeFileSync(opencodeAuthFilePath(), JSON.stringify(value), { mode: 0o600 });
+}
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+}
 
 describe("MiniMax provider", () => {
-  it("reads the first-party token-plan response and preserves model scopes", async () => {
-    const request = vi.fn(
-      async (input: RequestInfo | URL, init?: RequestInit) => {
-        expect(String(input)).toBe(
-          "https://api.minimax.io/v1/token_plan/remains",
-        );
-        expect(new Headers(init?.headers).get("authorization")).toBe(
-          `Bearer ${KEY}`,
-        );
-        return new Response(JSON.stringify(fixture("quota")), {
-          headers: { "content-type": "application/json" },
-        });
-      },
-    );
-    const report = await createMiniMaxAdapter({
-      credential: () => ({
-        status: "available",
-        key: KEY,
-        source: "pi:minimax",
-        path: "/auth.json",
-        baseUrl: "https://api.minimax.io",
-      }),
-      fetch: request,
-      now: () => Date.parse("2026-09-01T00:00:00.000Z"),
-    }).fetchQuota(OPTIONS);
+  it("extracts a literal key under the canonical provider ids", () => {
+    expect(
+      extractMinimaxCredential(
+        { minimax: { type: "api", key: KEY } },
+        "/auth.json",
+      ),
+    ).toEqual({ status: "available", apiKey: KEY, path: "/auth.json" });
+    expect(
+      extractMinimaxCredential(
+        { MiniMax: { type: "api", key: KEY } },
+        "/auth.json",
+      ),
+    ).toEqual({ status: "available", apiKey: KEY, path: "/auth.json" });
+    expect(
+      extractMinimaxCredential(
+        { MiniMax: { type: "api", key: KEY } },
+        "/auth.json",
+      ),
+    ).toEqual({ status: "available", apiKey: KEY, path: "/auth.json" });
+    expect(
+      extractMinimaxCredential(
+        { minimax: { type: "api", api_key: KEY } },
+        "/auth.json",
+      ),
+    ).toEqual({ status: "available", apiKey: KEY, path: "/auth.json" });
+  });
 
+  it("rejects environment, template, and command-referenced keys", () => {
+    for (const unsafe of ["$MINIMAX_API_KEY", "!command", "\u0000"]) {
+      expect(
+        extractMinimaxCredential(
+          { minimax: { type: "api", key: unsafe } },
+          "/auth.json",
+        ).status,
+      ).not.toBe("available");
+    }
+  });
+
+  it("falls through to the Pi source when opencode has no entry", async () => {
+    writeOpencodeAuth({ "some-other": { type: "api", key: KEY } });
+    writePiStore({ minimax: { type: "api_key", key: KEY } });
+
+    const request = vi.fn(async () =>
+      jsonResponse({ data: { id: "MiniMax/M2" } }),
+    );
+    const report = await createMinimaxAdapter({ fetch: request }).fetchQuota(
+      OPTIONS,
+    );
+
+    expect(String(request.mock.calls[0]?.[0])).toBe(
+      "https://api.MiniMax.chat/v1/models",
+    );
+    expect(
+      new Headers(request.mock.calls[0]?.[1]?.headers).get("authorization"),
+    ).toBe(`Bearer ${KEY}`);
     expect(report).toMatchObject({
       provider: "minimax",
       source: "api",
-      state: { status: "fresh", stale: false },
-      attempts: [{ source: "pi:minimax", status: "success" }],
-    });
-    expect(report.windows).toEqual([
-      expect.objectContaining({
-        id: "model:minimax-m3:5h",
-        kind: "model",
-        percentRemaining: 91,
-        windowSeconds: 18_000,
-      }),
-      expect.objectContaining({
-        id: "model:minimax-m3:7d",
-        kind: "model",
-        percentRemaining: 70,
-        windowSeconds: 604_800,
-      }),
-      expect.objectContaining({
-        id: "model:minimax-m2.7-highspeed:5h",
-        percentRemaining: 50,
-      }),
-      expect.objectContaining({
-        id: "model:minimax-m2.7-highspeed:7d",
-        kind: "model",
-        percentRemaining: 67,
-      }),
-    ]);
-    const interpreted = withQuotaSemantics(report, "2026-09-01T00:00:00.000Z");
-    expect(interpreted.quotaSemantics).toMatchObject({
-      status: "known",
-      effectiveAvailability: [
-        {
-          scope: "model:minimax-m3",
-          status: "known",
-          effectivePercentRemaining: 70,
-        },
-        {
-          scope: "model:minimax-m2.7-highspeed",
-          status: "known",
-          effectivePercentRemaining: 50,
-        },
-      ],
+      windows: [],
+      state: { status: "fresh", stale: false, authStatus: "usable" },
     });
     expect(JSON.stringify(report)).not.toContain(KEY);
   });
 
-  it("uses the balance endpoint for a secret API key without inventing windows", async () => {
-    const request = vi.fn(async (input: RequestInfo | URL) => {
-      expect(String(input)).toBe(
-        "https://api.minimax.io/account/query_balance",
-      );
-      return new Response(JSON.stringify(fixture("balance")));
-    });
-    const report = await createMiniMaxAdapter({
-      credential: () => ({
-        status: "available",
-        key: "sk-api-synthetic",
-        source: "minimax:config.json",
-        baseUrl: "https://api.minimax.io",
-      }),
-      fetch: request,
-    }).fetchQuota(OPTIONS);
-    expect(report).toMatchObject({
-      windows: [],
-      credits: { remaining: 12.5, unit: "usd" },
-      state: { status: "fresh" },
-    });
+  it("honours MINIMAX_API_KEY ahead of the configured stores", async () => {
+    process.env.MINIMAX_API_KEY = KEY;
+    writePiStore({ minimax: { type: "api_key", key: "pi-store-key" } });
+    writeOpencodeAuth({ minimax: { type: "api", key: "opencode-key" } });
+
+    const request = vi.fn(async () => jsonResponse({ data: {} }));
+    await createMinimaxAdapter({ fetch: request }).fetchQuota(OPTIONS);
+
+    expect(
+      new Headers(request.mock.calls[0]?.[1]?.headers).get("authorization"),
+    ).toBe(`Bearer ${KEY}`);
   });
 
-  it("tries CLI config after a Pi key is rejected", async () => {
-    const deleteCachedProvider = vi.fn();
-    const request = vi.fn(async (_url: string, init?: RequestInit) => {
-      const bearer = new Headers(init?.headers).get("authorization");
-      if (bearer === "Bearer stale-pi-key") {
-        return new Response(null, { status: 401 });
-      }
-      return new Response(JSON.stringify(fixture("balance")));
-    });
+  it("marks a structurally invalid Pi entry as credentialPresent", async () => {
+    writeOpencodeAuth({ "some-other": { type: "api", key: KEY } });
+    writePiStore({ minimax: { type: "api_key", key: "$REFERENCE" } });
 
-    const report = await createMiniMaxAdapter({
-      credential: () => [
-        {
-          status: "available",
-          key: "stale-pi-key",
-          source: "pi:minimax",
-          baseUrl: "https://api.minimax.io",
-        },
-        {
-          status: "available",
-          key: "sk-api-synthetic",
-          source: "minimax:config.json",
-          baseUrl: "https://api.minimax.io",
-        },
-      ],
-      fetch: request,
-      deleteCachedProvider,
-    }).fetchQuota(OPTIONS);
-
-    expect(report).toMatchObject({
-      state: {
-        status: "fresh",
-        sourcesTried: ["pi:minimax", "minimax:config.json"],
-      },
-      attempts: [
-        {
-          source: "pi:minimax",
-          status: "failed",
-          error: "provider_auth_rejected",
-        },
-        { source: "minimax:config.json", status: "success" },
-      ],
-      credits: { remaining: 12.5, unit: "usd" },
-    });
-    expect(request).toHaveBeenCalledTimes(2);
-    expect(deleteCachedProvider).not.toHaveBeenCalled();
-  });
-
-  it.each([1004, 2049])(
-    "tries CLI config after MiniMax application auth error %s",
-    async (statusCode) => {
-      const request = vi.fn(async (_url: string, init?: RequestInit) => {
-        const bearer = new Headers(init?.headers).get("authorization");
-        if (bearer === "Bearer stale-pi-key") {
-          return new Response(
-            JSON.stringify({ base_resp: { status_code: statusCode } }),
-          );
-        }
-        return new Response(JSON.stringify(fixture("balance")));
-      });
-
-      const report = await createMiniMaxAdapter({
-        credential: () => [
-          {
-            status: "available",
-            key: "stale-pi-key",
-            source: "pi:minimax",
-            baseUrl: "https://api.minimax.io",
-          },
-          {
-            status: "available",
-            key: "sk-api-synthetic",
-            source: "minimax:config.json",
-            baseUrl: "https://api.minimax.io",
-          },
-        ],
-        fetch: request,
-        deleteCachedProvider: vi.fn(),
-      }).fetchQuota(OPTIONS);
-
-      expect(report).toMatchObject({
-        state: { status: "fresh" },
-        attempts: [
-          {
-            source: "pi:minimax",
-            status: "failed",
-            error: "provider_auth_rejected",
-          },
-          { source: "minimax:config.json", status: "success" },
-        ],
-        credits: { remaining: 12.5, unit: "usd" },
-      });
-      expect(request).toHaveBeenCalledTimes(2);
-    },
-  );
-
-  it("reports an empirical auth rejection over an earlier missing source", async () => {
-    const deleteCachedProvider = vi.fn();
-    const report = await createMiniMaxAdapter({
-      credential: () => [
-        { status: "missing", source: "env:MINIMAX_API_KEY" },
-        {
-          status: "available",
-          key: "stale-pi-key",
-          source: "pi:minimax",
-          baseUrl: "https://api.minimax.io",
-        },
-        { status: "missing", source: "minimax:config.json" },
-      ],
-      fetch: async () => new Response(null, { status: 401 }),
-      deleteCachedProvider,
-    }).fetchQuota(OPTIONS);
-
-    expect(report).toMatchObject({
-      source: "unavailable",
-      state: { status: "auth_required", error: "provider_auth_rejected" },
-    });
-    expect(deleteCachedProvider).toHaveBeenCalledWith("minimax");
-  });
-
-  it("keeps a resolution error ahead of a later auth rejection", async () => {
-    const report = await createMiniMaxAdapter({
-      credential: () => [
-        {
-          status: "error",
-          source: "pi:minimax",
-          error: "file_too_large",
-        },
-        {
-          status: "available",
-          key: "stale-cli-key",
-          source: "minimax:config.json",
-          baseUrl: "https://api.minimax.io",
-        },
-      ],
-      fetch: async () => new Response(null, { status: 401 }),
-      readCachedProvider: () => undefined,
-    }).fetchQuota(OPTIONS);
-
-    expect(report).toMatchObject({
-      source: "unavailable",
-      state: { status: "error", error: "credential_resolution_failed" },
-    });
-  });
-
-  it("reports MiniMax application rate limits", async () => {
-    const request = vi.fn(
-      async () =>
-        new Response(JSON.stringify({ base_resp: { status_code: 1002 } })),
+    const request = vi.fn(async () => jsonResponse({ data: {} }));
+    const report = await createMinimaxAdapter({ fetch: request }).fetchQuota(
+      OPTIONS,
     );
 
-    const report = await createMiniMaxAdapter({
-      credential: () => ({
-        status: "available",
-        key: KEY,
-        source: "pi:minimax",
-        baseUrl: "https://api.minimax.io",
-      }),
-      fetch: request,
-      readCachedProvider: () => undefined,
-    }).fetchQuota(OPTIONS);
-
-    expect(report).toMatchObject({
-      source: "unavailable",
-      state: { status: "rate_limited", error: "provider_rate_limited" },
-    });
-    expect(request).toHaveBeenCalledTimes(1);
+    const attempt = (report.attempts ?? []).find(
+      (item) => item.source === "pi:minimax",
+    );
+    expect(attempt?.credentialPresent).toBe(true);
+    expect(report.state.status).toBe("auth_required");
   });
 
-  it("serves a stale snapshot for the failing credential's context on an application rate limit", async () => {
-    const cached = {
-      provider: "minimax",
-      label: "MiniMax",
-      source: "api",
-      windows: [
-        {
-          id: "model:minimax-m3:5h",
-          label: "MiniMax-M3 5h",
-          kind: "model",
-          percentRemaining: 40,
-        },
-      ],
-      state: {
-        status: "fresh",
-        stale: false,
-        refreshedAt: "2026-09-01T00:00:00.000Z",
-        sourcesTried: ["pi:minimax"],
-      },
-    };
-    const readCachedProvider = vi.fn((contextId: string) =>
-      /^[a-f0-9]{64}$/.test(contextId) ? cached : undefined,
+  it("marks a present-but-invalid opencode entry as credentialPresent", async () => {
+    writeOpencodeAuth({ minimax: { type: "api", key: "!command" } });
+    writePiStore({});
+
+    const request = vi.fn(async () => jsonResponse({ data: {} }));
+    const report = await createMinimaxAdapter({ fetch: request }).fetchQuota(
+      OPTIONS,
     );
 
-    const report = await createMiniMaxAdapter({
-      credential: () => ({
-        status: "available",
-        key: KEY,
-        source: "pi:minimax",
-        baseUrl: "https://api.minimax.io",
-      }),
-      fetch: async () =>
-        new Response(JSON.stringify({ base_resp: { status_code: 1002 } })),
-      readCachedProvider,
-    }).fetchQuota(OPTIONS);
-
-    expect(readCachedProvider).toHaveBeenCalledOnce();
-    expect(report).toMatchObject({
-      source: "cache",
-      windows: [{ id: "model:minimax-m3:5h", percentRemaining: 40 }],
-      state: {
-        status: "stale",
-        stale: true,
-        error: "provider_rate_limited",
-      },
-    });
+    const attempt = (report.attempts ?? []).find(
+      (item) => item.source === "opencode:auth.json",
+    );
+    expect(attempt?.credentialPresent).toBe(true);
   });
 
-  it("accepts the vendor's legacy remaining-count fallback only when no percentage exists", () => {
-    expect(
-      normalizeMiniMaxPayload({
-        model_remains: [
-          {
-            model_name: "MiniMax-M3",
-            start_time: 1788264000000,
-            end_time: 1788282000000,
-            current_interval_total_count: 100,
-            current_interval_usage_count: 25,
-            current_interval_status: 1,
-          },
-        ],
-      }).windows,
-    ).toEqual([
-      expect.objectContaining({
-        id: "model:minimax-m3:5h",
-        percentRemaining: 25,
-        percentUsed: 75,
-      }),
-    ]);
-    const unrecognized = normalizeMiniMaxPayload({ model_remains: [{}] });
-    expect(unrecognized.windows).toEqual([
-      expect.objectContaining({ id: "limit:1", kind: "unknown" }),
-    ]);
-    expect(unrecognized.untrustedWindowIds).toEqual(["limit:1"]);
-  });
+  it("leaves a structurally invalid Pi entry invisible to broken-state checks", () => {
+    writeOpencodeAuth({});
+    writePiStore({ minimax: { type: "oauth", access: "!ref" } });
 
-  it("reports a China-deployment balance as CNY", async () => {
-    const request = vi.fn(async (input: RequestInfo | URL) => {
-      expect(String(input)).toBe(
-        "https://api.minimaxi.com/account/query_balance",
-      );
-      return new Response(JSON.stringify(fixture("balance")));
-    });
-    const report = await createMiniMaxAdapter({
-      credential: () => ({
-        status: "available",
-        key: "sk-api-synthetic",
-        source: "minimax:config.json",
-        baseUrl: "https://api.minimaxi.com",
-      }),
-      fetch: request,
-    }).fetchQuota(OPTIONS);
-    expect(report).toMatchObject({
-      windows: [],
-      credits: { remaining: 12.5, unit: "cny" },
-      state: { status: "fresh" },
-    });
-  });
-
-  it("marks a named row with no recognized windows as untrusted", async () => {
-    const report = await createMiniMaxAdapter({
-      credential: () => ({
-        status: "available",
-        key: KEY,
-        source: "pi:minimax",
-        baseUrl: "https://api.minimax.io",
-      }),
-      fetch: async () =>
-        new Response(
-          JSON.stringify({
-            model_remains: [
-              {
-                model_name: "MiniMax-M3",
-                current_interval_remaining_percent: 90,
-              },
-              { model_name: "MiniMax-M4", daily_limit: 100, daily_used: 40 },
-            ],
-          }),
-        ),
-    }).fetchQuota(OPTIONS);
-
-    expect(report.state.status).toBe("fresh");
-    expect(report.state.untrustedWindowIds).toEqual(["limit:2"]);
-    expect(report.windows).toEqual([
-      expect.objectContaining({
-        id: "model:minimax-m3:window:current_interval",
-        kind: "model",
-      }),
-      expect.objectContaining({ id: "limit:2", kind: "unknown" }),
-    ]);
-    const interpreted = withQuotaSemantics(report, "2026-09-01T00:00:00.000Z");
-    expect(interpreted.quotaSemantics).toMatchObject({
-      status: "partial",
-      unresolvedWindowIds: ["limit:2"],
-      effectiveAvailability: [
-        expect.objectContaining({
-          scope: "model:minimax-m3",
-          status: "unknown",
-        }),
-      ],
-    });
-  });
-
-  it.each(["current_interval", "current_weekly"] as const)(
-    "keeps incomplete %s bounds from overstating model headroom",
-    async (prefix) => {
-      const readablePrefix =
-        prefix === "current_interval" ? "current_weekly" : "current_interval";
-      const report = await createMiniMaxAdapter({
-        credential: () => ({
-          status: "available",
-          key: KEY,
-          source: "pi:minimax",
-          baseUrl: "https://api.minimax.io",
-        }),
-        fetch: async () =>
-          new Response(
-            JSON.stringify({
-              model_remains: [
-                {
-                  model_name: "MiniMax-M3",
-                  [`${readablePrefix}_remaining_percent`]: 90,
-                  [`${prefix}_status`]: 1,
-                  [`${prefix}_total_count`]: 100,
-                },
-              ],
-            }),
-          ),
-      }).fetchQuota(OPTIONS);
-
-      expect(report.state.status).toBe("fresh");
-      expect(report.windows).toHaveLength(2);
-      expect(
-        report.windows.map(({ percentRemaining }) => percentRemaining),
-      ).toContain(undefined);
-      const interpreted = withQuotaSemantics(
-        report,
-        "2026-09-01T00:00:00.000Z",
-      );
-      const availability = interpreted.quotaSemantics?.effectiveAvailability;
-      expect(availability).toEqual([
-        expect.objectContaining({
-          scope: "model:minimax-m3",
-          status: "unknown",
-          boundedBy: [
-            "model:minimax-m3:window:current_interval",
-            "model:minimax-m3:window:weekly",
-          ],
-        }),
-      ]);
-      expect(availability?.[0]?.effectivePercentRemaining).toBeUndefined();
-    },
-  );
-
-  it("reports no-allocation MiniMax rows as fresh empty quota", async () => {
-    const payload = {
-      model_remains: [
-        {
-          model_name: "Speech-HD",
-          current_interval_total_count: 0,
-          current_interval_usage_count: 0,
-          current_interval_remaining_percent: 100,
-          current_interval_status: 3,
-          current_weekly_total_count: 0,
-          current_weekly_usage_count: 0,
-          current_weekly_remaining_percent: 100,
-          current_weekly_status: 3,
-        },
-      ],
-    };
-    expect(normalizeMiniMaxPayload(payload).windows).toEqual([]);
-
-    const readCachedProvider = vi.fn(() => ({
-      provider: "minimax",
-      label: "MiniMax",
-      source: "api",
-      windows: [
-        {
-          id: "model:old:5h",
-          label: "Old 5h",
-          kind: "model",
-          percentRemaining: 25,
-        },
-      ],
-      state: {
-        status: "fresh",
-        stale: false,
-        refreshedAt: "2026-09-01T00:00:00.000Z",
-        sourcesTried: ["pi:minimax"],
-      },
-    }));
-    const report = await createMiniMaxAdapter({
-      credential: () => ({
-        status: "available",
-        key: KEY,
-        source: "pi:minimax",
-        baseUrl: "https://api.minimax.io",
-      }),
-      fetch: async () => new Response(JSON.stringify(payload)),
-      readCachedProvider,
-      now: () => Date.parse("2026-09-02T00:00:00.000Z"),
-    }).fetchQuota(OPTIONS);
-
-    expect(report).toMatchObject({
-      source: "api",
-      windows: [],
-      state: { status: "fresh", stale: false },
-    });
-    expect(readCachedProvider).not.toHaveBeenCalled();
-  });
-
-  it("labels MiniMax interval windows from reported duration", () => {
-    expect(
-      normalizeMiniMaxPayload({
-        model_remains: [
-          {
-            model_name: "Speech-HD",
-            start_time: 1788264000000,
-            end_time: 1788350400000,
-            current_interval_total_count: 100,
-            current_interval_usage_count: 75,
-            current_interval_status: 1,
-          },
-        ],
-      }).windows,
-    ).toEqual([
-      expect.objectContaining({
-        id: "model:speech-hd:window:1d",
-        label: "Speech-HD 1d",
-        percentRemaining: 75,
-        windowSeconds: 86_400,
-      }),
-    ]);
-  });
-
-  it("preserves rate limits with an invalid Retry-After date", async () => {
-    const report = await createMiniMaxAdapter({
-      credential: () => ({
-        status: "available",
-        key: KEY,
-        source: "pi:minimax",
-        baseUrl: "https://api.minimax.io",
-      }),
-      fetch: async () =>
-        new Response(null, {
-          status: 429,
-          headers: { "retry-after": "999999999999999999999" },
-        }),
-      readCachedProvider: () => undefined,
-    }).fetchQuota(OPTIONS);
-
-    expect(report).toMatchObject({
-      state: { status: "rate_limited", error: "provider_rate_limited" },
-    });
-    expect(report.state.retryAfter).toBeUndefined();
-  });
-
-  it("reports missing and invalid local credentials without making a request", async () => {
-    const fetch = vi.fn();
-    const deleteCachedProvider = vi.fn();
-    const missing = await createMiniMaxAdapter({
-      credential: () => ({ status: "missing", source: "pi:minimax" }),
-      fetch: fetch as typeof globalThis.fetch,
-      deleteCachedProvider,
-    }).fetchQuota(OPTIONS);
-    const invalid = await createMiniMaxAdapter({
-      credential: () => ({
-        status: "invalid",
-        source: "minimax:config.json",
-        error: "credential_missing",
-      }),
-      fetch: fetch as typeof globalThis.fetch,
-      deleteCachedProvider,
-    }).inspectAuth(OPTIONS);
-
-    expect(missing).toMatchObject({
-      source: "unavailable",
-      state: {
-        status: "auth_required",
-        error: "minimax_credential_unavailable",
-      },
-    });
-    expect(invalid.sources).toEqual([
-      expect.objectContaining({
-        source: "minimax:config.json",
-        status: "invalid",
-        error: "credential_missing",
-      }),
-    ]);
-    expect(fetch).not.toHaveBeenCalled();
-    expect(deleteCachedProvider).toHaveBeenCalledWith("minimax");
-  });
-
-  it("recognizes provider-owned config and Pi auth shapes", () => {
-    expect(
-      extractMiniMaxCredential(
-        { minimax: { type: "api_key", key: KEY } },
-        "/auth.json",
-      ),
-    ).toMatchObject({
-      status: "available",
-      key: KEY,
-    });
-    expect(
-      extractMiniMaxCliCredentials(
-        { api_key: KEY, region: "cn" },
-        "/config.json",
-      ),
-    ).toEqual([
-      expect.objectContaining({
-        status: "available",
-        key: KEY,
-        baseUrl: "https://api.minimaxi.com",
-      }),
-    ]);
-    expect(extractMiniMaxCredential({ minimax: KEY }, "/auth.json")).toEqual({
-      status: "invalid",
-      source: "pi:minimax",
-      path: "/auth.json",
-      error: "credential_missing",
-    });
-  });
-
-  it("uses co-stored MiniMax CLI credentials in OAuth-first order", async () => {
-    const originalHome = process.env.HOME;
-    const originalPiDir = process.env.PI_CODING_AGENT_DIR;
-    const originalMmxDir = process.env.MMX_CONFIG_DIR;
-    const originalApiKey = process.env.MINIMAX_API_KEY;
-    const tempDir = mkdtempSync(join(tmpdir(), "quota-axi-minimax-"));
-    const mmxDir = join(tempDir, "mmx");
-    try {
-      process.env.HOME = tempDir;
-      process.env.PI_CODING_AGENT_DIR = join(tempDir, "missing-pi");
-      process.env.MMX_CONFIG_DIR = mmxDir;
-      delete process.env.MINIMAX_API_KEY;
-      mkdirSync(mmxDir, { recursive: true });
-      writeFileSync(
-        join(mmxDir, "config.json"),
-        JSON.stringify({
-          api_key: "sk-api-synthetic",
-          oauth: { access_token: "stale-oauth-token" },
-        }),
-      );
-      const request = vi.fn(async (_url: string, init?: RequestInit) => {
-        const bearer = new Headers(init?.headers).get("authorization");
-        if (bearer === "Bearer stale-oauth-token") {
-          return new Response(null, { status: 401 });
-        }
-        return new Response(JSON.stringify(fixture("balance")));
-      });
-
-      const report = await createMiniMaxAdapter({
-        credential: resolveMiniMaxCredentials,
-        fetch: request,
-      }).fetchQuota(OPTIONS);
-
-      expect(
-        request.mock.calls.map(([, init]) =>
-          new Headers(init?.headers).get("authorization"),
-        ),
-      ).toEqual(["Bearer stale-oauth-token", "Bearer sk-api-synthetic"]);
-      expect(report).toMatchObject({
-        state: { status: "fresh" },
-        credits: { remaining: 12.5, unit: "usd" },
-      });
-    } finally {
-      if (originalHome === undefined) delete process.env.HOME;
-      else process.env.HOME = originalHome;
-      if (originalPiDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
-      else process.env.PI_CODING_AGENT_DIR = originalPiDir;
-      if (originalMmxDir === undefined) delete process.env.MMX_CONFIG_DIR;
-      else process.env.MMX_CONFIG_DIR = originalMmxDir;
-      if (originalApiKey === undefined) delete process.env.MINIMAX_API_KEY;
-      else process.env.MINIMAX_API_KEY = originalApiKey;
-      rmSync(tempDir, { recursive: true, force: true });
-    }
-  });
-
-  it("uses the shared Pi auth path expansion", () => {
-    const originalHome = process.env.HOME;
-    const originalPiDir = process.env.PI_CODING_AGENT_DIR;
-    const originalMmxDir = process.env.MMX_CONFIG_DIR;
-    const originalApiKey = process.env.MINIMAX_API_KEY;
-    const tempDir = mkdtempSync(join(tmpdir(), "quota-axi-minimax-"));
-    const piDir = join(tempDir, "pi-agent");
-    try {
-      process.env.HOME = tempDir;
-      process.env.PI_CODING_AGENT_DIR = "~/pi-agent";
-      process.env.MMX_CONFIG_DIR = join(tempDir, "missing-mmx");
-      delete process.env.MINIMAX_API_KEY;
-      mkdirSync(piDir, { recursive: true });
-      writeFileSync(
-        join(piDir, "auth.json"),
-        JSON.stringify({ minimax: { api_key: KEY } }),
-      );
-
-      expect(resolveMiniMaxCredentials()).toMatchObject([
-        { status: "missing", source: "env:MINIMAX_API_KEY" },
-        {
-          status: "available",
-          key: KEY,
-          source: "pi:minimax",
-        },
-        { status: "missing", source: "minimax:config.json" },
-      ]);
-    } finally {
-      if (originalHome === undefined) delete process.env.HOME;
-      else process.env.HOME = originalHome;
-      if (originalPiDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
-      else process.env.PI_CODING_AGENT_DIR = originalPiDir;
-      if (originalMmxDir === undefined) delete process.env.MMX_CONFIG_DIR;
-      else process.env.MMX_CONFIG_DIR = originalMmxDir;
-      if (originalApiKey === undefined) delete process.env.MINIMAX_API_KEY;
-      else process.env.MINIMAX_API_KEY = originalApiKey;
-      rmSync(tempDir, { recursive: true, force: true });
-    }
-  });
-
-  it("falls through to CLI config while reporting a broken Pi source", async () => {
-    const originalPiDir = process.env.PI_CODING_AGENT_DIR;
-    const originalMmxDir = process.env.MMX_CONFIG_DIR;
-    const originalApiKey = process.env.MINIMAX_API_KEY;
-    const tempDir = mkdtempSync(join(tmpdir(), "quota-axi-minimax-"));
-    const piDir = join(tempDir, "pi-agent");
-    const mmxDir = join(tempDir, "mmx");
-    try {
-      process.env.PI_CODING_AGENT_DIR = piDir;
-      process.env.MMX_CONFIG_DIR = mmxDir;
-      delete process.env.MINIMAX_API_KEY;
-      mkdirSync(piDir, { recursive: true });
-      mkdirSync(mmxDir, { recursive: true });
-      writeFileSync(
-        join(piDir, "auth.json"),
-        JSON.stringify({ minimax: { api_key: "${MINIMAX_API_KEY}" } }),
-      );
-      writeFileSync(
-        join(mmxDir, "config.json"),
-        JSON.stringify({ api_key: "sk-api-synthetic" }),
-      );
-      const request = vi.fn(
-        async () => new Response(JSON.stringify(fixture("balance"))),
-      );
-
-      const report = await createMiniMaxAdapter({
-        credential: resolveMiniMaxCredentials,
-        fetch: request,
-        now: () => Date.parse("2026-09-01T00:00:00.000Z"),
-      }).fetchQuota(OPTIONS);
-      const interpreted = withQuotaSemantics(
-        report,
-        "2026-09-01T00:00:00.000Z",
-      );
-
-      expect(report).toMatchObject({
-        state: {
-          status: "fresh",
-          sourcesTried: [
-            "env:MINIMAX_API_KEY",
-            "pi:minimax",
-            "minimax:config.json",
-          ],
-        },
-        attempts: [
-          {
-            source: "env:MINIMAX_API_KEY",
-            status: "skipped",
-            error: "minimax_credential_unavailable",
-          },
-          {
-            source: "pi:minimax",
-            status: "failed",
-            error: "minimax_credential_invalid",
-          },
-          { source: "minimax:config.json", status: "success" },
-        ],
-        credits: { remaining: 12.5, unit: "usd" },
-      });
-      expect(interpreted.state.degradedSources).toEqual([
-        { source: "pi:minimax", error: "minimax_credential_invalid" },
-      ]);
-      expect(request).toHaveBeenCalledOnce();
-    } finally {
-      if (originalPiDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
-      else process.env.PI_CODING_AGENT_DIR = originalPiDir;
-      if (originalMmxDir === undefined) delete process.env.MMX_CONFIG_DIR;
-      else process.env.MMX_CONFIG_DIR = originalMmxDir;
-      if (originalApiKey === undefined) delete process.env.MINIMAX_API_KEY;
-      else process.env.MINIMAX_API_KEY = originalApiKey;
-      rmSync(tempDir, { recursive: true, force: true });
-    }
-  });
-
-  it("keeps cache on a later transient source failure", async () => {
-    const originalPiDir = process.env.PI_CODING_AGENT_DIR;
-    const originalMmxDir = process.env.MMX_CONFIG_DIR;
-    const originalApiKey = process.env.MINIMAX_API_KEY;
-    const tempDir = mkdtempSync(join(tmpdir(), "quota-axi-minimax-"));
-    const piDir = join(tempDir, "pi-agent");
-    const mmxFile = join(tempDir, "mmx-file");
-    try {
-      process.env.PI_CODING_AGENT_DIR = piDir;
-      process.env.MMX_CONFIG_DIR = mmxFile;
-      delete process.env.MINIMAX_API_KEY;
-      mkdirSync(piDir, { recursive: true });
-      writeFileSync(
-        join(piDir, "auth.json"),
-        JSON.stringify({ minimax: { api_key: "${MINIMAX_API_KEY}" } }),
-      );
-      writeFileSync(mmxFile, "not a directory");
-      const deleteCachedProvider = vi.fn();
-      const cached = {
-        provider: "minimax" as const,
-        label: "MiniMax",
-        source: "api" as const,
-        windows: [
-          {
-            id: "model:minimax-m3:5h",
-            label: "MiniMax-M3 5h",
-            kind: "model" as const,
-            percentRemaining: 40,
-          },
-        ],
-        state: {
-          status: "fresh" as const,
-          stale: false,
-          refreshedAt: "2026-09-01T00:00:00.000Z",
-          sourcesTried: ["minimax:config.json"],
-        },
-      };
-      const readCachedProvider = vi
-        .fn()
-        .mockReturnValueOnce(undefined)
-        .mockImplementation((contextId: string) =>
-          /^[a-f0-9]{64}$/.test(contextId) ? cached : undefined,
+    const request = vi.fn(async () => jsonResponse({ data: {} }));
+    return createMinimaxAdapter({ fetch: request })
+      .fetchQuota(OPTIONS)
+      .then((report) => {
+        const attempt = (report.attempts ?? []).find(
+          (item) => item.source === "pi:minimax",
         );
-
-      const unresolved = await createMiniMaxAdapter({
-        credential: resolveMiniMaxCredentials,
-        fetch: vi.fn() as typeof globalThis.fetch,
-        readCachedProvider,
-        deleteCachedProvider,
-      }).fetchQuota(OPTIONS);
-
-      expect(unresolved).toMatchObject({
-        state: { status: "error", error: "credential_resolution_failed" },
-        attempts: [
-          {
-            source: "env:MINIMAX_API_KEY",
-            status: "skipped",
-            error: "minimax_credential_unavailable",
-          },
-          {
-            source: "pi:minimax",
-            status: "failed",
-            error: "minimax_credential_invalid",
-          },
-          {
-            source: "minimax:config.json",
-            status: "failed",
-            error: "credential_resolution_failed",
-          },
-        ],
+        expect(attempt?.credentialPresent).toBe(true);
+        expect(report.state.status).toBe("auth_required");
       });
-      expect(deleteCachedProvider).not.toHaveBeenCalled();
-      expect(readCachedProvider).toHaveBeenCalledOnce();
+  });
 
-      const stale = await createMiniMaxAdapter({
-        credential: resolveMiniMaxCredentials,
-        fetch: vi.fn() as typeof globalThis.fetch,
-        readCachedProvider,
-        deleteCachedProvider,
-      }).fetchQuota(OPTIONS);
+  it("reports auth_required on a 401, error on a malformed body, never ok on transport failures", async () => {
+    writeOpencodeAuth({ minimax: { type: "api", key: KEY } });
 
-      expect(stale).toMatchObject({
-        source: "cache",
-        windows: [{ id: "model:minimax-m3:5h", percentRemaining: 40 }],
-        state: {
-          status: "stale",
-          stale: true,
-          error: "credential_resolution_failed",
-        },
-      });
-      expect(deleteCachedProvider).not.toHaveBeenCalled();
-    } finally {
-      if (originalPiDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
-      else process.env.PI_CODING_AGENT_DIR = originalPiDir;
-      if (originalMmxDir === undefined) delete process.env.MMX_CONFIG_DIR;
-      else process.env.MMX_CONFIG_DIR = originalMmxDir;
-      if (originalApiKey === undefined) delete process.env.MINIMAX_API_KEY;
-      else process.env.MINIMAX_API_KEY = originalApiKey;
-      rmSync(tempDir, { recursive: true, force: true });
+    const rejected = await createMinimaxAdapter({
+      fetch: vi.fn(async () => new Response("nope", { status: 401 })),
+    }).fetchQuota(OPTIONS);
+    expect(rejected.state).toMatchObject({
+      status: "auth_required",
+      error: "provider_auth_rejected",
+    });
+
+    const malformed = await createMinimaxAdapter({
+      fetch: vi.fn(async () => jsonResponse({ unexpected: true })),
+    }).fetchQuota(OPTIONS);
+    expect(malformed.state.status).toBe("fresh");
+    expect(malformed.state.authStatus).toBe("usable");
+
+    const transportError = await createMinimaxAdapter({
+      fetch: vi.fn(async () => {
+        throw new Error("socket hangup");
+      }),
+    }).fetchQuota(OPTIONS);
+    expect(transportError.state.status).toBe("error");
+    expect(transportError.state.error).toBe("network_unavailable");
+    expect(JSON.stringify(transportError)).not.toContain(KEY);
+  });
+
+  it("treats every empty credential store as missing, not as degraded", async () => {
+    writeOpencodeAuth({});
+    writePiStore({});
+
+    const request = vi.fn(async () => jsonResponse({ data: {} }));
+    const report = await createMinimaxAdapter({ fetch: request }).fetchQuota(
+      OPTIONS,
+    );
+
+    expect(report.state.status).toBe("auth_required");
+    for (const attempt of report.attempts ?? []) {
+      expect(attempt.credentialPresent).toBeUndefined();
     }
   });
 
-  it("falls through to CLI config when the Pi path cannot be read", async () => {
-    const originalPiDir = process.env.PI_CODING_AGENT_DIR;
-    const originalMmxDir = process.env.MMX_CONFIG_DIR;
-    const originalApiKey = process.env.MINIMAX_API_KEY;
-    const tempDir = mkdtempSync(join(tmpdir(), "quota-axi-minimax-"));
-    const piFile = join(tempDir, "pi-agent-file");
-    const mmxDir = join(tempDir, "mmx");
-    try {
-      process.env.PI_CODING_AGENT_DIR = piFile;
-      process.env.MMX_CONFIG_DIR = mmxDir;
-      delete process.env.MINIMAX_API_KEY;
-      writeFileSync(piFile, "not a directory");
-      mkdirSync(mmxDir, { recursive: true });
-      writeFileSync(
-        join(mmxDir, "config.json"),
-        JSON.stringify({ api_key: "sk-api-synthetic" }),
-      );
-      const request = vi.fn(
-        async () => new Response(JSON.stringify(fixture("balance"))),
-      );
+  it("inspects every configured source for the auth command", async () => {
+    writeOpencodeAuth({ minimax: { type: "api", key: KEY } });
+    writePiStore({ "some-other": { type: "api", key: KEY } });
 
-      const report = await createMiniMaxAdapter({
-        credential: resolveMiniMaxCredentials,
-        fetch: request,
-      }).fetchQuota(OPTIONS);
+    const report = await createMinimaxAdapter().inspectAuth(OPTIONS);
 
-      expect(report).toMatchObject({
-        state: { status: "fresh" },
-        attempts: [
-          {
-            source: "env:MINIMAX_API_KEY",
-            status: "skipped",
-            error: "minimax_credential_unavailable",
-          },
-          {
-            source: "pi:minimax",
-            status: "failed",
-            error: "credential_resolution_failed",
-          },
-          { source: "minimax:config.json", status: "success" },
-        ],
-      });
-      expect(request).toHaveBeenCalledOnce();
-    } finally {
-      if (originalPiDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
-      else process.env.PI_CODING_AGENT_DIR = originalPiDir;
-      if (originalMmxDir === undefined) delete process.env.MMX_CONFIG_DIR;
-      else process.env.MMX_CONFIG_DIR = originalMmxDir;
-      if (originalApiKey === undefined) delete process.env.MINIMAX_API_KEY;
-      else process.env.MINIMAX_API_KEY = originalApiKey;
-      rmSync(tempDir, { recursive: true, force: true });
-    }
+    expect(report.sources.map((source) => source.source)).toEqual([
+      "MINIMAX_API_KEY",
+      "opencode:auth.json",
+      "pi:minimax",
+    ]);
+    const opencodeSource = report.sources.find(
+      (source) => source.source === "opencode:auth.json",
+    );
+    expect(opencodeSource?.status).toBe("available");
+    const piSource = report.sources.find(
+      (source) => source.source === "pi:minimax",
+    );
+    expect(piSource?.status).toBe("missing");
   });
 
-  it("treats an oversized credential file as a read failure, not bad content", async () => {
-    const originalPiDir = process.env.PI_CODING_AGENT_DIR;
-    const originalMmxDir = process.env.MMX_CONFIG_DIR;
-    const originalApiKey = process.env.MINIMAX_API_KEY;
-    const tempDir = mkdtempSync(join(tmpdir(), "quota-axi-minimax-"));
-    const piDir = join(tempDir, "pi-agent");
-    try {
-      process.env.PI_CODING_AGENT_DIR = piDir;
-      process.env.MMX_CONFIG_DIR = join(tempDir, "missing-mmx");
-      delete process.env.MINIMAX_API_KEY;
-      mkdirSync(piDir, { recursive: true });
-      writeFileSync(
-        join(piDir, "auth.json"),
-        JSON.stringify({
-          minimax: { api_key: KEY },
-          padding: "x".repeat(70 * 1024),
-        }),
-      );
-      const deleteCachedProvider = vi.fn();
-      const readCachedProvider = vi.fn(() => undefined);
-      const adapter = createMiniMaxAdapter({
-        credential: resolveMiniMaxCredentials,
-        fetch: vi.fn() as typeof globalThis.fetch,
-        readCachedProvider,
-        deleteCachedProvider,
-      });
+  it("respects a custom credential source list, keeping its order", () => {
+    expect(
+      defaultMinimaxCredentialSources().map((source) => source.name),
+    ).toEqual(["opencode:auth.json", "pi:minimax"]);
+  });
 
-      const report = await adapter.fetchQuota(OPTIONS);
-      const auth = await adapter.inspectAuth(OPTIONS);
-
-      expect(report).toMatchObject({
-        state: { status: "error", error: "credential_resolution_failed" },
-        attempts: [
-          {
-            source: "env:MINIMAX_API_KEY",
-            status: "skipped",
-            error: "minimax_credential_unavailable",
-          },
-          {
-            source: "pi:minimax",
-            status: "failed",
-            error: "credential_resolution_failed",
-          },
-          {
-            source: "minimax:config.json",
-            status: "skipped",
-            error: "minimax_credential_unavailable",
-          },
-        ],
-      });
-      expect(deleteCachedProvider).not.toHaveBeenCalled();
-      expect(readCachedProvider).toHaveBeenCalledOnce();
-      expect(auth.sources).toEqual([
-        expect.objectContaining({
-          source: "env:MINIMAX_API_KEY",
-          status: "missing",
-        }),
-        expect.objectContaining({
-          source: "pi:minimax",
-          status: "error",
-          error: "file_too_large",
-        }),
-        expect.objectContaining({
-          source: "minimax:config.json",
-          status: "missing",
-        }),
-      ]);
-    } finally {
-      if (originalPiDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
-      else process.env.PI_CODING_AGENT_DIR = originalPiDir;
-      if (originalMmxDir === undefined) delete process.env.MMX_CONFIG_DIR;
-      else process.env.MMX_CONFIG_DIR = originalMmxDir;
-      if (originalApiKey === undefined) delete process.env.MINIMAX_API_KEY;
-      else process.env.MINIMAX_API_KEY = originalApiKey;
-      rmSync(tempDir, { recursive: true, force: true });
-    }
+  it("never logs the bearer, even when the upstream returns an error that mentions it", async () => {
+    process.env.MINIMAX_API_KEY = KEY;
+    const fetchMock = vi.fn(async () => {
+      throw new Error(`upstream saw ${KEY}`);
+    });
+    const report = await createMinimaxAdapter({ fetch: fetchMock }).fetchQuota(
+      OPTIONS,
+    );
+    expect(JSON.stringify(report)).not.toContain(KEY);
+    expect(report.state.error).not.toContain(KEY);
   });
 });
