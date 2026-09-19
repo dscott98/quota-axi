@@ -78,19 +78,88 @@ describe("MiniMax provider", () => {
         { minimax: { type: "api", key: KEY } },
         "/auth.json",
       ),
-    ).toEqual({ status: "available", apiKey: KEY, path: "/auth.json" });
-    expect(
-      extractMinimaxCredential(
-        { MiniMax: { type: "api", key: KEY } },
-        "/auth.json",
-      ),
-    ).toEqual({ status: "available", apiKey: KEY, path: "/auth.json" });
+    ).toEqual({ status: "available", apiKeys: [KEY], path: "/auth.json" });
     expect(
       extractMinimaxCredential(
         { "minimax-coding-plan": { type: "api", key: KEY } },
         "/auth.json",
       ),
-    ).toEqual({ status: "available", apiKey: KEY, path: "/auth.json" });
+    ).toEqual({ status: "available", apiKeys: [KEY], path: "/auth.json" });
+  });
+
+  it.each([
+    ["opencode", "MiniMax"],
+    ["pi", "MiniMax"],
+    ["pi", "minimax-coding-plan"],
+  ])("ignores unsupported %s credential id %s", async (store, id) => {
+    writeOpencodeAuth(
+      store === "opencode" ? { [id]: { type: "api", key: KEY } } : {},
+    );
+    writePiStore(store === "pi" ? { [id]: { type: "api_key", key: KEY } } : {});
+    const request = vi.fn(async () => jsonResponse({}));
+    const adapter = createMinimaxAdapter({ fetch: request });
+    const report = await adapter.fetchQuota(OPTIONS);
+    expect(request).not.toHaveBeenCalled();
+    expect(report.state.status).toBe("auth_required");
+    const auth = await adapter.inspectAuth(OPTIONS);
+    expect(auth.sources.every((source) => source.status === "missing")).toBe(
+      true,
+    );
+  });
+
+  it.each([
+    [200, ["first"], "fresh"],
+    [401, ["first", "second"], "fresh"],
+    [403, ["first", "second"], "fresh"],
+    [429, ["first"], "rate_limited"],
+    [503, ["first"], "error"],
+  ] as const)(
+    "selects OpenCode candidates after HTTP %i",
+    async (status, expected, verdict) => {
+      writeOpencodeAuth({
+        "minimax-coding-plan": { type: "api", key: "second" },
+        minimax: { type: "api", key: "first" },
+      });
+      writePiStore({ minimax: { type: "api_key", key: "pi-key" } });
+      const bearers: string[] = [];
+      const report = await createMinimaxAdapter({
+        fetch: async (_input, init) => {
+          const key = new Headers(init?.headers).get("authorization")!.slice(7);
+          bearers.push(key);
+          return jsonResponse(
+            CODING_PLAN_REMAINS,
+            key === "first" ? status : 200,
+          );
+        },
+      }).fetchQuota(OPTIONS);
+      expect(bearers).toEqual(expected);
+      expect(report.state.status).toBe(verdict);
+      expect(report.attempts?.map((attempt) => attempt.status)).toEqual(
+        expected.map((_, index) =>
+          index === 0 && status !== 200 ? "failed" : "success",
+        ),
+      );
+      if (verdict === "fresh") expect(report.windows).toHaveLength(2);
+    },
+  );
+
+  it("tries Pi only after both OpenCode candidates are rejected", async () => {
+    writeOpencodeAuth({
+      minimax: { type: "api", key: "first" },
+      "minimax-coding-plan": { type: "api", key: "second" },
+    });
+    writePiStore({ minimax: { type: "api_key", key: "pi-key" } });
+    const bearers: string[] = [];
+    const report = await createMinimaxAdapter({
+      fetch: async (_input, init) => {
+        const key = new Headers(init?.headers).get("authorization")!.slice(7);
+        bearers.push(key);
+        return jsonResponse(CODING_PLAN_REMAINS, key === "pi-key" ? 200 : 401);
+      },
+    }).fetchQuota(OPTIONS);
+    expect(bearers).toEqual(["first", "second", "pi-key"]);
+    expect(report.state.status).toBe("fresh");
+    expect(report.windows).toHaveLength(2);
   });
 
   it.each([
