@@ -44,15 +44,6 @@ const MINIMAX_HOST = "api.minimax.io";
 const MINIMAX_PROBE_PATH = "/v1/api/openplatform/coding_plan/remains";
 
 const MINIMAX_PROVIDER_IDS = ["minimax", "MiniMax", "minimax-coding-plan"];
-const MINIMAX_CREDENTIAL_KEYS = [
-  "key",
-  "apiKey",
-  "api_key",
-  "token",
-  "accessToken",
-  "auth_token",
-];
-
 const ENV_MINIMAX_API_KEY = "MINIMAX_API_KEY";
 const OPENCODE_AUTH_SOURCE = "opencode:auth.json";
 const PI_MINIMAX_SOURCE = "pi:minimax";
@@ -115,11 +106,6 @@ function extractPiMinimaxCredential(
       if (key) return { status: "available", apiKey: key, path };
       return { status: "invalid", path, error: "invalid_credential" };
     }
-    if (type === "oauth") {
-      const token = usableLiteralSecret(entry.access);
-      if (token) return { status: "available", apiKey: token, path };
-      return { status: "invalid", path, error: "invalid_credential" };
-    }
     return { status: "invalid", path, error: "unsupported_entry_type" };
   }
   return { status: "missing", path };
@@ -133,15 +119,9 @@ function entryType(entry: Record<string, unknown>): string | undefined {
 }
 
 function extractCredentialKey(entry: unknown): string | undefined {
-  if (typeof entry === "string") return usableLiteralSecret(entry);
-  if (!objectValue(entry)) return undefined;
-  for (const key of MINIMAX_CREDENTIAL_KEYS) {
-    const candidate = usableLiteralSecret(
-      (entry as Record<string, unknown>)[key],
-    );
-    if (candidate) return candidate;
-  }
-  return undefined;
+  const record = objectValue(entry);
+  if (record?.type !== "api") return undefined;
+  return usableLiteralSecret(record.key);
 }
 
 export type MinimaxCredentialSource = {
@@ -489,16 +469,17 @@ function minimaxMeasurement(
   | undefined {
   const remainingPercent = numericValue(model[period.remainingPercent]);
   const total = numericValue(model[period.total]);
-  const usage = numericValue(model[period.usage]);
+  const usageRemaining = numericValue(model[period.usage]);
   const remaining = numericValue(model[period.remaining]);
   if (
     total !== undefined &&
     total > 0 &&
-    ((usage !== undefined && (usage < 0 || usage > total)) ||
+    ((usageRemaining !== undefined &&
+      (usageRemaining < 0 || usageRemaining > total)) ||
       (remaining !== undefined && (remaining < 0 || remaining > total)) ||
-      (usage !== undefined &&
+      (usageRemaining !== undefined &&
         remaining !== undefined &&
-        usage + remaining !== total))
+        usageRemaining !== remaining))
   )
     return "invalid";
 
@@ -509,17 +490,21 @@ function minimaxMeasurement(
       percentRemaining: remainingPercent,
     };
   }
-  if (total === undefined && usage === undefined && remaining === undefined)
+  if (
+    total === undefined &&
+    usageRemaining === undefined &&
+    remaining === undefined
+  )
     return undefined;
   if (
     total === undefined ||
     total <= 0 ||
-    (usage === undefined && remaining === undefined)
+    (usageRemaining === undefined && remaining === undefined)
   )
     return "invalid";
 
-  const percentUsed = ((usage ?? total - remaining!) / total) * 100;
-  return { percentUsed, percentRemaining: 100 - percentUsed };
+  const percentRemaining = ((usageRemaining ?? remaining!) / total) * 100;
+  return { percentUsed: 100 - percentRemaining, percentRemaining };
 }
 
 function remainsText(value: unknown): string | undefined {

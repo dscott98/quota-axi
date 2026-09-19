@@ -91,12 +91,31 @@ describe("MiniMax provider", () => {
         "/auth.json",
       ),
     ).toEqual({ status: "available", apiKey: KEY, path: "/auth.json" });
-    expect(
-      extractMinimaxCredential(
-        { minimax: { type: "api", api_key: KEY } },
-        "/auth.json",
-      ),
-    ).toEqual({ status: "available", apiKey: KEY, path: "/auth.json" });
+  });
+
+  it.each([
+    KEY,
+    { key: KEY },
+    { type: "oauth", key: KEY, access: KEY },
+    ...["apiKey", "api_key", "token", "accessToken", "auth_token"].map(
+      (field) => ({ type: "api", [field]: KEY }),
+    ),
+  ])("rejects non-native OpenCode credential records: %j", async (entry) => {
+    writeOpencodeAuth({ minimax: entry });
+    writePiStore({});
+    const request = vi.fn(async () => jsonResponse({}));
+    const report = await createMinimaxAdapter({ fetch: request }).fetchQuota(
+      OPTIONS,
+    );
+    expect(request).not.toHaveBeenCalled();
+    expect(report.attempts).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          source: "opencode:auth.json",
+          credentialPresent: true,
+        }),
+      ]),
+    );
   });
 
   it("rejects environment, template, and command-referenced keys", () => {
@@ -217,16 +236,45 @@ describe("MiniMax provider", () => {
     expect(report.windows).toMatchObject([
       {
         id: "model:general:interval",
-        percentUsed: 25,
-        percentRemaining: 75,
+        percentUsed: 75,
+        percentRemaining: 25,
       },
       {
         id: "model:general:weekly",
-        percentUsed: 25,
-        percentRemaining: 75,
+        percentUsed: 75,
+        percentRemaining: 25,
       },
     ]);
   });
+
+  it.each([0, 1444, 1500])(
+    "reports %i remaining requests for both count-metered periods",
+    async (remaining) => {
+      const report = await createMinimaxAdapter({
+        envApiKey: () => KEY,
+        credentialSources: [],
+        fetch: async () =>
+          jsonResponse({
+            model_remains: [
+              {
+                model_name: "general",
+                current_interval_total_count: 1500,
+                current_interval_usage_count: remaining,
+                current_weekly_total_count: 1500,
+                current_weekly_usage_count: remaining,
+              },
+            ],
+          }),
+      }).fetchQuota(OPTIONS);
+      expect(report.windows).toHaveLength(2);
+      for (const window of report.windows) {
+        expect(window.percentRemaining).toBeCloseTo((remaining / 1500) * 100);
+        expect(window.percentUsed).toBeCloseTo(
+          ((1500 - remaining) / 1500) * 100,
+        );
+      }
+    },
+  );
 
   it("rejects vendor-encoded authentication failures and untrusted raw counters", async () => {
     process.env.MINIMAX_API_KEY = KEY;
@@ -284,9 +332,9 @@ describe("MiniMax provider", () => {
   });
 
   it.each([
-    { current_interval_usage_count: 500 },
+    { current_interval_usage_count: 1000 },
     { current_interval_remain_count: 1000 },
-    { current_interval_usage_count: 500, current_interval_remain_count: 1000 },
+    { current_interval_usage_count: 1000, current_interval_remain_count: 1000 },
   ])(
     "accepts consistent fractional count percentages: %j",
     async (counters) => {
@@ -341,7 +389,7 @@ describe("MiniMax provider", () => {
   );
 
   it("recognizes the canonical opencode Coding Plan credential id", async () => {
-    writeOpencodeAuth({ "minimax-coding-plan": { key: KEY } });
+    writeOpencodeAuth({ "minimax-coding-plan": { type: "api", key: KEY } });
     const request = vi.fn(async () => jsonResponse({ model_remains: [] }));
 
     await createMinimaxAdapter({ fetch: request }).fetchQuota(OPTIONS);
@@ -393,20 +441,23 @@ describe("MiniMax provider", () => {
     expect(attempt?.credentialPresent).toBe(true);
   });
 
-  it("leaves a structurally invalid Pi entry invisible to broken-state checks", () => {
+  it("rejects Pi OAuth without probing its access token", async () => {
     writeOpencodeAuth({});
-    writePiStore({ minimax: { type: "oauth", access: "!ref" } });
-
-    const request = vi.fn(async () => jsonResponse({ data: {} }));
-    return createMinimaxAdapter({ fetch: request })
-      .fetchQuota(OPTIONS)
-      .then((report) => {
-        const attempt = (report.attempts ?? []).find(
-          (item) => item.source === "pi:minimax",
-        );
-        expect(attempt?.credentialPresent).toBe(true);
-        expect(report.state.status).toBe("auth_required");
-      });
+    writePiStore({ minimax: { type: "oauth", access: KEY } });
+    const request = vi.fn(async () => jsonResponse({}));
+    const report = await createMinimaxAdapter({ fetch: request }).fetchQuota(
+      OPTIONS,
+    );
+    expect(request).not.toHaveBeenCalled();
+    expect(report.attempts).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          source: "pi:minimax",
+          credentialPresent: true,
+          error: "minimax_credential_invalid: unsupported_entry_type",
+        }),
+      ]),
+    );
   });
 
   it("reports auth_required on a 401, error on a malformed body, never ok on transport failures", async () => {
