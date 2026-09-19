@@ -170,6 +170,32 @@ describe("MiniMax provider", () => {
     });
   });
 
+  it("retains seconds-epoch current_interval_end_time as an end_time alias", async () => {
+    process.env.MINIMAX_API_KEY = KEY;
+    const report = await createMinimaxAdapter({
+      fetch: vi.fn(async () =>
+        jsonResponse({
+          model_remains: [
+            {
+              model_name: "general",
+              current_interval_remaining_percent: 50,
+              current_interval_end_time: 1760000400,
+            },
+          ],
+        }),
+      ),
+    }).fetchQuota(OPTIONS);
+
+    expect(report.windows).toMatchObject([
+      {
+        id: "model:general:interval",
+        percentUsed: 50,
+        percentRemaining: 50,
+        resetsAt: "2025-10-09T09:00:00.000Z",
+      },
+    ]);
+  });
+
   it("supports count-metered Coding Plans when vendor percentages are absent", async () => {
     process.env.MINIMAX_API_KEY = KEY;
     const report = await createMinimaxAdapter({
