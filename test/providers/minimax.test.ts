@@ -489,4 +489,41 @@ describe("MiniMax provider", () => {
     expect(JSON.stringify(report)).not.toContain(KEY);
     expect(report.state.error).not.toContain(KEY);
   });
+
+  it("treats whitespace, template, and command references in MINIMAX_API_KEY as absent", async () => {
+    writeOpencodeAuth({ minimax: { type: "api", key: KEY } });
+    const request = vi.fn(async () =>
+      jsonResponse({ data: { model_remains: [] } }),
+    );
+    for (const unsafe of ["  ", "\t", "$MINIMAX_API_KEY", "!cmd"]) {
+      const report = await createMinimaxAdapter({
+        envApiKey: () => unsafe,
+        fetch: request,
+      }).fetchQuota(OPTIONS);
+      // The env source is skipped as absent and credential handover reaches
+      // the configured opencode store, which succeeds.
+      expect(request).toHaveBeenCalled();
+      const envAttempt = (report.attempts ?? []).find(
+        (attempt) => attempt.source === "MINIMAX_API_KEY",
+      );
+      expect(envAttempt).toBeUndefined();
+      const opencodeAttempt = (report.attempts ?? []).find(
+        (attempt) => attempt.source === "opencode:auth.json",
+      );
+      expect(opencodeAttempt?.status).toBe("success");
+    }
+  });
+
+  it("reflects a non-usable MINIMAX_API_KEY as missing in the auth command", async () => {
+    writeOpencodeAuth({ minimax: { type: "api", key: KEY } });
+    for (const unsafe of ["  ", "$MINIMAX_API_KEY", "!cmd"]) {
+      const report = await createMinimaxAdapter({
+        envApiKey: () => unsafe,
+      }).inspectAuth(OPTIONS);
+      const envSource = report.sources.find(
+        (source) => source.source === "MINIMAX_API_KEY",
+      );
+      expect(envSource?.status).toBe("missing");
+    }
+  });
 });

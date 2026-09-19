@@ -273,7 +273,7 @@ async function fetchQuotaWithDependencies(
     return undefined;
   }
 
-  const envKey = dependencies.envApiKey();
+  const envKey = usableLiteralSecret(dependencies.envApiKey());
   if (envKey) {
     const report = await tryCredential(ENV_MINIMAX_API_KEY, envKey);
     if (report) return report;
@@ -591,7 +591,7 @@ function inspectAuthWithDependencies(
   dependencies: MinimaxDependencies,
 ): Promise<AuthProviderReport> {
   const sources: AuthSourceReport[] = [];
-  const envKey = dependencies.envApiKey();
+  const envKey = usableLiteralSecret(dependencies.envApiKey());
   sources.push({
     source: ENV_MINIMAX_API_KEY,
     status: envKey ? "available" : "missing",
