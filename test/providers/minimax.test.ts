@@ -283,6 +283,63 @@ describe("MiniMax provider", () => {
     ]);
   });
 
+  it.each([
+    { current_interval_usage_count: 500 },
+    { current_interval_remain_count: 1000 },
+    { current_interval_usage_count: 500, current_interval_remain_count: 1000 },
+  ])(
+    "accepts consistent fractional count percentages: %j",
+    async (counters) => {
+      const report = await createMinimaxAdapter({
+        envApiKey: () => KEY,
+        credentialSources: [],
+        fetch: async () =>
+          jsonResponse({
+            model_remains: [
+              {
+                model_name: "general",
+                current_interval_total_count: 1500,
+                ...counters,
+              },
+            ],
+          }),
+      }).fetchQuota(OPTIONS);
+      expect(report.windows).toHaveLength(1);
+      expect(report.windows[0]?.percentUsed).toBeCloseTo(100 / 3);
+      expect(report.windows[0]?.percentRemaining).toBeCloseTo(200 / 3);
+      expect(report.state.untrustedWindowIds).toBeUndefined();
+    },
+  );
+
+  it.each([
+    { current_interval_usage_count: 150 },
+    { current_interval_remain_count: 101 },
+    { current_interval_usage_count: 50, current_interval_remain_count: 40 },
+  ])(
+    "rejects inconsistent counters even with vendor percentages: %j",
+    async (counters) => {
+      const report = await createMinimaxAdapter({
+        envApiKey: () => KEY,
+        credentialSources: [],
+        fetch: async () =>
+          jsonResponse({
+            model_remains: [
+              {
+                model_name: "general",
+                current_interval_total_count: 100,
+                current_interval_remaining_percent: 50,
+                ...counters,
+              },
+            ],
+          }),
+      }).fetchQuota(OPTIONS);
+      expect(report.windows).toEqual([]);
+      expect(report.state.untrustedWindowIds).toEqual([
+        "model:general:interval",
+      ]);
+    },
+  );
+
   it("recognizes the canonical opencode Coding Plan credential id", async () => {
     writeOpencodeAuth({ "minimax-coding-plan": { key: KEY } });
     const request = vi.fn(async () => jsonResponse({ model_remains: [] }));
