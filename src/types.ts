@@ -36,7 +36,7 @@ export const PROVIDER_IDS = [
 ] as const satisfies readonly ProviderId[];
 
 export const DEFAULT_PROVIDER_IDS = PROVIDER_IDS.filter(
-  (provider) => provider !== "minimax" && provider !== "openrouter",
+  (provider) => provider !== "minimax",
 );
 
 export type ProviderSource =
