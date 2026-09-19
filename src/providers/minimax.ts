@@ -638,8 +638,8 @@ function objectValue(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
-function stringValue(value: string | undefined): string | undefined {
-  return value && value.trim() ? value.trim() : undefined;
+function stringValue(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
 function firstString(
