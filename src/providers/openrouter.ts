@@ -243,6 +243,7 @@ async function fetchQuotaWithDependencies(
   const attempts: SourceAttempt[] = [];
   let credentialMissing = true;
   let definitiveAuth: string | undefined;
+  let readError: string | undefined;
   let lastError: string | undefined;
 
   async function tryCredential(
@@ -298,10 +299,14 @@ async function fetchQuotaWithDependencies(
       });
       if (resolution.status !== "missing") {
         credentialMissing = false;
-        definitiveAuth = preferDefinitiveAuth(
-          definitiveAuth,
-          credentialError(resolution),
-        );
+        if (resolution.status === "error") {
+          readError ??= credentialError(resolution);
+        } else {
+          definitiveAuth = preferDefinitiveAuth(
+            definitiveAuth,
+            credentialError(resolution),
+          );
+        }
       }
       lastError = credentialError(resolution);
       continue;
@@ -322,7 +327,7 @@ async function fetchQuotaWithDependencies(
 
   return failedOpenRouterReport(
     attempts,
-    definitiveAuth ?? lastError ?? "openrouter_quota_failed",
+    readError ?? definitiveAuth ?? lastError ?? "openrouter_quota_failed",
     credentialMissing && !definitiveAuth,
   );
 }
@@ -387,6 +392,7 @@ async function probeOpenRouter(
     }
     throw new Error("network_unavailable", { cause: error });
   } finally {
+    controller.abort();
     clearTimeout(timer);
   }
 }
