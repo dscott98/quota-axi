@@ -78,12 +78,6 @@ describe("MiniMax provider", () => {
     ).toEqual({ status: "available", apiKey: KEY, path: "/auth.json" });
     expect(
       extractMinimaxCredential(
-        { MiniMax: { type: "api", key: KEY } },
-        "/auth.json",
-      ),
-    ).toEqual({ status: "available", apiKey: KEY, path: "/auth.json" });
-    expect(
-      extractMinimaxCredential(
         { minimax: { type: "api", api_key: KEY } },
         "/auth.json",
       ),

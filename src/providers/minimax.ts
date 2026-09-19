@@ -8,7 +8,7 @@
  *
  * It honours the smallest opt-in surface agreed in the package:
  *  - `$MINIMAX_API_KEY` first (explicit caller intent).
- *  - opencode `auth.json` `minimax` / `MiniMax` / `MiniMax` literal key entry.
+ *  - opencode `auth.json` `minimax` / `MiniMax` literal key entry.
  *  - Pi's `$PI_CODING_AGENT_DIR/auth.json` `minimax` / `MiniMax` entry.
  *
  * Nothing else is read or written. The adapter never refreshes credentials,
@@ -39,7 +39,7 @@ const RESPONSE_LIMIT_BYTES = 262_144;
 const MINIMAX_HOST = "api.MiniMax.chat";
 const MINIMAX_PROBE_PATH = "/v1/models";
 
-const MINIMAX_PROVIDER_IDS = ["minimax", "MiniMax", "MiniMax"];
+const MINIMAX_PROVIDER_IDS = ["minimax", "MiniMax"];
 const MINIMAX_CREDENTIAL_KEYS = [
   "key",
   "apiKey",
