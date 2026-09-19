@@ -4,12 +4,14 @@
  * OpenRouter publishes a single bounded, read-only `GET /api/v1/auth/key`
  * endpoint that returns the key's label, current usage, and (when set) its
  * spending limit. quota-axi reports exactly that:
- *  - When `data.limit` is set, the adapter surfaces a single `credits` window
- *    with `spentUsd` and `limitUsd` so callers can see real usage. There is
- *    no reset timestamp in this response, so pace/runway stay unknown.
- *  - When `data.limit` is `null` (free / unlimited), the adapter confirms
- *    auth usability but reports no windows - matching the Grok Pi OAuth
- *    "live_no_quota" path. It never derives a percentage from `usage` alone.
+ *  - When `data.usage` is numeric and `data.limit` is positive, the adapter
+ *    surfaces a single `credits` window with `spentUsd` and `limitUsd` so
+ *    callers can see real usage. There is no reset timestamp in this response,
+ *    so pace/runway stay unknown.
+ *  - When the limit is null, missing, or zero, or usage is unavailable, the
+ *    adapter confirms auth usability but reports no windows - matching the Grok
+ *    Pi OAuth "live_no_quota" path. It never derives a percentage from usage
+ *    alone.
  *
  * It honours the smallest opt-in surface agreed in the package:
  *  - `$OPENROUTER_API_KEY` first (explicit caller intent).
@@ -204,7 +206,7 @@ export type NormalizedOpenRouterKey = {
   usage?: number;
   limit?: number;
   isFreeTier?: boolean;
-  /** True when the response carried both a numeric usage and a non-null limit. */
+  /** True when the response carried numeric usage and a positive limit. */
   credits: boolean;
 };
 
