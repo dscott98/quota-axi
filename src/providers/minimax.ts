@@ -15,6 +15,9 @@
  * presence.
  */
 
+import { providerFetch } from "../lib/http.js";
+import { readBoundedResponseText } from "../lib/bounded-response.js";
+import { selectCredential } from "./credential-selection.js";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { classifyPiAuthEntry } from "../lib/pi-auth-store.js";
@@ -207,7 +210,7 @@ export function createMinimaxAdapter(
   const dependencies: MinimaxDependencies = {
     credentialSources: defaultMinimaxCredentialSources(),
     envApiKey: () => process.env[ENV_MINIMAX_API_KEY],
-    fetch: globalThis.fetch,
+    fetch: providerFetch,
     now: Date.now,
     deadlineMs: OPERATION_DEADLINE_MS,
     ...overrides,
@@ -233,27 +236,46 @@ async function fetchQuotaWithDependencies(
   let definitiveAuth: string | undefined;
   let lastError: string | undefined;
 
+  async function tryCredential(
+    source: string,
+    apiKey: string,
+  ): Promise<ProviderQuota | undefined> {
+    const selection = await selectCredential(
+      [{ source, credential: apiKey, localState: "valid" }],
+      async (candidate) => {
+        try {
+          return {
+            kind: "quota",
+            result: await probeMinimax(candidate.credential, dependencies),
+          };
+        } catch (error) {
+          const code = errorCode(error);
+          return {
+            kind: code === "provider_auth_rejected" ? "rejected" : "transient",
+            error: code,
+          };
+        }
+      },
+    );
+    if (selection.outcome === "quota") {
+      attempts.push({ source, status: "success" });
+      return successMinimaxReport(selection.result!, attempts, dependencies);
+    }
+    const code = selection.transientError ?? selection.results[0]!.error!;
+    attempts.push({ source, status: "failed", error: code });
+    if (selection.outcome === "transient") {
+      return failedMinimaxReport(attempts, code);
+    }
+    credentialMissing = false;
+    definitiveAuth = preferDefinitiveAuth(definitiveAuth, code);
+    lastError = code;
+    return undefined;
+  }
+
   const envKey = dependencies.envApiKey();
   if (envKey) {
-    attempts.push({ source: ENV_MINIMAX_API_KEY, status: "failed" });
-    try {
-      const probe = await probeMinimax(envKey, dependencies);
-      attempts[attempts.length - 1] = {
-        source: ENV_MINIMAX_API_KEY,
-        status: "success",
-      };
-      return successMinimaxReport(probe, attempts, dependencies);
-    } catch (error) {
-      const code = errorCode(error);
-      attempts[attempts.length - 1] = {
-        source: ENV_MINIMAX_API_KEY,
-        status: "failed",
-        error: code,
-      };
-      credentialMissing = false;
-      definitiveAuth = preferDefinitiveAuth(definitiveAuth, code);
-      lastError = code;
-    }
+    const report = await tryCredential(ENV_MINIMAX_API_KEY, envKey);
+    if (report) return report;
   }
 
   for (const source of dependencies.credentialSources) {
@@ -276,25 +298,8 @@ async function fetchQuotaWithDependencies(
       continue;
     }
 
-    attempts.push({ source: source.name, status: "failed" });
-    try {
-      const probe = await probeMinimax(resolution.apiKey, dependencies);
-      attempts[attempts.length - 1] = {
-        source: source.name,
-        status: "success",
-      };
-      return successMinimaxReport(probe, attempts, dependencies);
-    } catch (error) {
-      const code = errorCode(error);
-      attempts[attempts.length - 1] = {
-        source: source.name,
-        status: "failed",
-        error: code,
-      };
-      credentialMissing = false;
-      definitiveAuth = preferDefinitiveAuth(definitiveAuth, code);
-      lastError = code;
-    }
+    const report = await tryCredential(source.name, resolution.apiKey);
+    if (report) return report;
   }
 
   if (attempts.length === 0) {
@@ -346,19 +351,7 @@ async function probeMinimax(
     }
     if (response.status === 429) throw new Error("provider_rate_limited");
     if (!response.ok) throw new Error("provider_request_rejected");
-    const declaredLength = response.headers?.get("content-length")?.trim();
-    const parsedLength = declaredLength ? Number(declaredLength) : undefined;
-    if (
-      parsedLength !== undefined &&
-      Number.isInteger(parsedLength) &&
-      parsedLength > RESPONSE_LIMIT_BYTES
-    ) {
-      throw new Error("response_too_large");
-    }
-    const text = await response.text();
-    if (text.length > RESPONSE_LIMIT_BYTES) {
-      throw new Error("response_too_large");
-    }
+    const text = await readBoundedResponseText(response, RESPONSE_LIMIT_BYTES);
     let payload: unknown;
     try {
       payload = JSON.parse(text);
@@ -489,6 +482,20 @@ function minimaxMeasurement(
   | "invalid"
   | undefined {
   const remainingPercent = numericValue(model[period.remainingPercent]);
+  const total = numericValue(model[period.total]);
+  const usage = numericValue(model[period.usage]);
+  const remaining = numericValue(model[period.remaining]);
+  if (
+    total !== undefined &&
+    total > 0 &&
+    ((usage !== undefined && (usage < 0 || usage > total)) ||
+      (remaining !== undefined && (remaining < 0 || remaining > total)) ||
+      (usage !== undefined &&
+        remaining !== undefined &&
+        usage + remaining !== total))
+  )
+    return "invalid";
+
   if (remainingPercent !== undefined) {
     if (remainingPercent < 0 || remainingPercent > 100) return "invalid";
     return {
@@ -496,29 +503,17 @@ function minimaxMeasurement(
       percentRemaining: remainingPercent,
     };
   }
-
-  const total = numericValue(model[period.total]);
-  const usage = numericValue(model[period.usage]);
-  const remaining = numericValue(model[period.remaining]);
   if (total === undefined && usage === undefined && remaining === undefined)
     return undefined;
   if (
     total === undefined ||
     total <= 0 ||
-    (usage !== undefined && (usage < 0 || usage > total)) ||
-    (remaining !== undefined && (remaining < 0 || remaining > total)) ||
-    (usage !== undefined &&
-      remaining !== undefined &&
-      usage + remaining !== total)
+    (usage === undefined && remaining === undefined)
   )
     return "invalid";
 
-  const rawUsed = usage ?? total - remaining!;
-  const rawRemaining = remaining ?? total - usage!;
-  const percentUsed = (rawUsed / total) * 100;
-  const percentRemaining = (rawRemaining / total) * 100;
-  if (percentUsed + percentRemaining !== 100) return "invalid";
-  return { percentUsed, percentRemaining };
+  const percentUsed = ((usage ?? total - remaining!) / total) * 100;
+  return { percentUsed, percentRemaining: 100 - percentUsed };
 }
 
 function remainsText(value: unknown): string | undefined {

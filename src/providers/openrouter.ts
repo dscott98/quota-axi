@@ -22,6 +22,9 @@
  * never calls inference, and never infers a quota percentage from usage alone.
  */
 
+import { providerFetch } from "../lib/http.js";
+import { readBoundedResponseText } from "../lib/bounded-response.js";
+import { selectCredential } from "./credential-selection.js";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { classifyPiAuthEntry } from "../lib/pi-auth-store.js";
@@ -216,7 +219,7 @@ export function createOpenRouterAdapter(
   const dependencies: OpenRouterDependencies = {
     credentialSources: defaultOpenRouterCredentialSources(),
     envApiKey: () => process.env[ENV_OPENROUTER_API_KEY],
-    fetch: globalThis.fetch,
+    fetch: providerFetch,
     now: Date.now,
     deadlineMs: OPERATION_DEADLINE_MS,
     ...overrides,
@@ -242,27 +245,46 @@ async function fetchQuotaWithDependencies(
   let definitiveAuth: string | undefined;
   let lastError: string | undefined;
 
+  async function tryCredential(
+    source: string,
+    apiKey: string,
+  ): Promise<ProviderQuota | undefined> {
+    const selection = await selectCredential(
+      [{ source, credential: apiKey, localState: "valid" }],
+      async (candidate) => {
+        try {
+          return {
+            kind: "quota",
+            result: await probeOpenRouter(candidate.credential, dependencies),
+          };
+        } catch (error) {
+          const code = errorCode(error);
+          return {
+            kind: code === "provider_auth_rejected" ? "rejected" : "transient",
+            error: code,
+          };
+        }
+      },
+    );
+    if (selection.outcome === "quota") {
+      attempts.push({ source, status: "success" });
+      return successOpenRouterReport(selection.result!, attempts, dependencies);
+    }
+    const code = selection.transientError ?? selection.results[0]!.error!;
+    attempts.push({ source, status: "failed", error: code });
+    if (selection.outcome === "transient") {
+      return failedOpenRouterReport(attempts, code);
+    }
+    credentialMissing = false;
+    definitiveAuth = preferDefinitiveAuth(definitiveAuth, code);
+    lastError = code;
+    return undefined;
+  }
+
   const envKey = dependencies.envApiKey();
   if (envKey) {
-    attempts.push({ source: ENV_OPENROUTER_API_KEY, status: "failed" });
-    try {
-      const probe = await probeOpenRouter(envKey, dependencies);
-      attempts[attempts.length - 1] = {
-        source: ENV_OPENROUTER_API_KEY,
-        status: "success",
-      };
-      return successOpenRouterReport(probe, attempts, dependencies);
-    } catch (error) {
-      const code = errorCode(error);
-      attempts[attempts.length - 1] = {
-        source: ENV_OPENROUTER_API_KEY,
-        status: "failed",
-        error: code,
-      };
-      credentialMissing = false;
-      definitiveAuth = preferDefinitiveAuth(definitiveAuth, code);
-      lastError = code;
-    }
+    const report = await tryCredential(ENV_OPENROUTER_API_KEY, envKey);
+    if (report) return report;
   }
 
   for (const source of dependencies.credentialSources) {
@@ -285,25 +307,8 @@ async function fetchQuotaWithDependencies(
       continue;
     }
 
-    attempts.push({ source: source.name, status: "failed" });
-    try {
-      const probe = await probeOpenRouter(resolution.apiKey, dependencies);
-      attempts[attempts.length - 1] = {
-        source: source.name,
-        status: "success",
-      };
-      return successOpenRouterReport(probe, attempts, dependencies);
-    } catch (error) {
-      const code = errorCode(error);
-      attempts[attempts.length - 1] = {
-        source: source.name,
-        status: "failed",
-        error: code,
-      };
-      credentialMissing = false;
-      definitiveAuth = preferDefinitiveAuth(definitiveAuth, code);
-      lastError = code;
-    }
+    const report = await tryCredential(source.name, resolution.apiKey);
+    if (report) return report;
   }
 
   if (attempts.length === 0) {
@@ -355,19 +360,7 @@ async function probeOpenRouter(
     }
     if (response.status === 429) throw new Error("provider_rate_limited");
     if (!response.ok) throw new Error("provider_request_rejected");
-    const declaredLength = response.headers?.get("content-length")?.trim();
-    const parsedLength = declaredLength ? Number(declaredLength) : undefined;
-    if (
-      parsedLength !== undefined &&
-      Number.isInteger(parsedLength) &&
-      parsedLength > RESPONSE_LIMIT_BYTES
-    ) {
-      throw new Error("response_too_large");
-    }
-    const text = await response.text();
-    if (text.length > RESPONSE_LIMIT_BYTES) {
-      throw new Error("response_too_large");
-    }
+    const text = await readBoundedResponseText(response, RESPONSE_LIMIT_BYTES);
     let payload: unknown;
     try {
       payload = JSON.parse(text);
