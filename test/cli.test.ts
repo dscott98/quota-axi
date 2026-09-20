@@ -81,7 +81,7 @@ afterEach(() => {
 });
 
 describe("CLI flag parsing", () => {
-  it("defaults to all supported providers", () => {
+  it("defaults to providers enabled for automatic probes", () => {
     expect(parseFlags([]).providers).toEqual([
       "claude",
       "codex",
@@ -94,7 +94,6 @@ describe("CLI flag parsing", () => {
       "alibaba",
       "opencode-go",
       "commandcode",
-      "minimax",
       "mimo",
       "deepseek",
       "openrouter",
@@ -137,7 +136,6 @@ describe("CLI flag parsing", () => {
           "alibaba",
           "opencode-go",
           "commandcode",
-          "minimax",
           "mimo",
           "deepseek",
           "openrouter",
@@ -1601,7 +1599,6 @@ describe("default TOON decision blocks", () => {
       "grok",
       "kimi",
       "mimo",
-      "minimax",
       "opencode-go",
       "openrouter",
       "zai",
