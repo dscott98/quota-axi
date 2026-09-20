@@ -15,8 +15,8 @@
  * presence.
  */
 
-import { providerFetch } from "../lib/http.js";
-import { readBoundedResponseText } from "../lib/bounded-response.js";
+import { providerFetch, readBoundedResponseBody } from "../lib/http.js";
+import { readFileSync, statSync } from "node:fs";
 import { selectCredential } from "./credential-selection.js";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -39,8 +39,9 @@ import type {
 
 const LABEL = "MiniMax";
 const OPERATION_DEADLINE_MS = 15_000;
-const RESPONSE_LIMIT_BYTES = 262_144;
-const MINIMAX_HOST = "api.minimax.io";
+const MINIMAX_GLOBAL_BASE_URL = "https://api.minimax.io";
+const MINIMAX_CHINA_BASE_URL = "https://api.minimaxi.com";
+const MINIMAX_CLI_SOURCE = "minimax:config.json";
 const MINIMAX_PROBE_PATH = "/v1/api/openplatform/coding_plan/remains";
 
 const OPENCODE_MINIMAX_IDS = ["minimax", "minimax-coding-plan"];
@@ -49,7 +50,7 @@ const OPENCODE_AUTH_SOURCE = "opencode:auth.json";
 const PI_MINIMAX_SOURCE = "pi:minimax";
 
 export type MinimaxCredentialResolution =
-  | { status: "available"; apiKeys: string[]; path: string }
+  | { status: "available"; apiKeys: string[]; path: string; baseUrl?: string }
   | { status: "missing"; path: string }
   | { status: "invalid"; path: string; error: string }
   | { status: "error"; path: string; error: string };
@@ -68,6 +69,76 @@ export function opencodeAuthFilePath(): string {
     if (localAppData) return join(localAppData, "opencode", "auth.json");
   }
   return join(join(homedir(), ".local", "share"), "opencode", "auth.json");
+}
+
+export function minimaxConfigPath(): string {
+  return join(
+    process.env.MMX_CONFIG_DIR?.trim() || join(homedir(), ".mmx"),
+    "config.json",
+  );
+}
+
+function safeBaseUrl(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:" || url.username || url.password)
+      return undefined;
+    if (!["api.minimax.io", "api.minimaxi.com"].includes(url.hostname))
+      return undefined;
+    return url.origin;
+  } catch {
+    return undefined;
+  }
+}
+
+function configuredBaseUrl(): string {
+  return safeBaseUrl(process.env.MINIMAX_BASE_URL) ?? MINIMAX_GLOBAL_BASE_URL;
+}
+
+function extractMinimaxCliCredentials(
+  value: unknown,
+  path: string,
+): MinimaxCredentialResolution {
+  const root = objectValue(value);
+  if (!root) return { status: "invalid", path, error: "json_parse_error" };
+  const oauth = objectValue(root.oauth);
+  const apiKeys = [
+    usableLiteralSecret(oauth?.access_token),
+    usableLiteralSecret(root.api_key),
+  ].filter((key): key is string => key !== undefined);
+  if (apiKeys.length === 0) {
+    return Object.hasOwn(root, "api_key") || oauth !== undefined
+      ? { status: "invalid", path, error: "invalid_credential" }
+      : { status: "missing", path };
+  }
+  const baseUrl =
+    safeBaseUrl(root.base_url) ??
+    safeBaseUrl(oauth?.resource_url) ??
+    (stringValue(root.region)?.toLowerCase() === "cn"
+      ? MINIMAX_CHINA_BASE_URL
+      : configuredBaseUrl());
+  return { status: "available", apiKeys, path, baseUrl };
+}
+
+function readMinimaxCliConfig(path: string): JsonFileReadResult {
+  let text: string;
+  try {
+    if (statSync(path).size > 65_536)
+      return { status: "invalid", error: "file_too_large" };
+    text = readFileSync(path, "utf8");
+  } catch (error) {
+    return objectValue(error)?.code === "ENOENT"
+      ? { status: "missing" }
+      : { status: "invalid", error: "file_read_error" };
+  }
+  if (Buffer.byteLength(text, "utf8") > 65_536)
+    return { status: "invalid", error: "file_too_large" };
+  try {
+    return { status: "success", value: JSON.parse(text) };
+  } catch {
+    return { status: "invalid", error: "json_parse_error" };
+  }
 }
 
 export function extractMinimaxCredential(
@@ -127,13 +198,14 @@ export type MinimaxCredentialSource = {
   name: string;
   path: () => string;
   extract: (value: unknown, path: string) => MinimaxCredentialResolution;
+  read?: (path: string) => JsonFileReadResult;
 };
 
 function resolveMinimaxCredentialSource(
   source: MinimaxCredentialSource,
 ): MinimaxCredentialResolution {
   const path = source.path();
-  const result: JsonFileReadResult = readJsonFileResult(path);
+  const result = (source.read ?? readJsonFileResult)(path);
   if (result.status === "missing") return { status: "missing", path };
   if (result.status === "invalid") {
     return result.error === "file_read_error"
@@ -166,6 +238,12 @@ export function defaultMinimaxCredentialSources(): MinimaxCredentialSource[] {
       path: resolvePiAuthFilePath,
       extract: extractPiMinimaxCredential,
     },
+    {
+      name: MINIMAX_CLI_SOURCE,
+      path: minimaxConfigPath,
+      extract: extractMinimaxCliCredentials,
+      read: readMinimaxCliConfig,
+    },
   ];
 }
 
@@ -178,6 +256,7 @@ type MinimaxDependencies = {
 };
 
 export type NormalizedMinimaxProbe = {
+  credits?: ProviderQuota["credits"];
   windows: QuotaWindow[];
   untrustedWindowIds: string[];
 };
@@ -218,6 +297,7 @@ async function fetchQuotaWithDependencies(
   async function tryCredentials(
     source: string,
     apiKeys: string[],
+    baseUrl = configuredBaseUrl(),
   ): Promise<ProviderQuota | undefined> {
     const selection = await selectCredential(
       apiKeys.map((credential) => ({
@@ -229,7 +309,12 @@ async function fetchQuotaWithDependencies(
         try {
           return {
             kind: "quota",
-            result: await probeMinimax(candidate.credential, dependencies),
+            result: await probeMinimax(
+              candidate.credential,
+              baseUrl,
+              source === MINIMAX_CLI_SOURCE,
+              dependencies,
+            ),
           };
         } catch (error) {
           const code = errorCode(error);
@@ -291,7 +376,11 @@ async function fetchQuotaWithDependencies(
       continue;
     }
 
-    const report = await tryCredentials(source.name, resolution.apiKeys);
+    const report = await tryCredentials(
+      source.name,
+      resolution.apiKeys,
+      resolution.baseUrl,
+    );
     if (report) return report;
   }
 
@@ -323,9 +412,17 @@ function preferDefinitiveAuth(
 
 async function probeMinimax(
   apiKey: string,
+  baseUrl: string,
+  nativeCli: boolean,
   dependencies: MinimaxDependencies,
 ): Promise<NormalizedMinimaxProbe> {
-  const url = `https://${MINIMAX_HOST}${MINIMAX_PROBE_PATH}`;
+  const balance = apiKey.startsWith("sk-api-");
+  const path = balance
+    ? "/account/query_balance"
+    : nativeCli || new URL(baseUrl).hostname === "api.minimaxi.com"
+      ? "/v1/token_plan/remains"
+      : MINIMAX_PROBE_PATH;
+  const url = `${baseUrl}${path}`;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), dependencies.deadlineMs);
   try {
@@ -344,10 +441,16 @@ async function probeMinimax(
     }
     if (response.status === 429) throw new Error("provider_rate_limited");
     if (!response.ok) throw new Error("provider_request_rejected");
-    const text = await readBoundedResponseText(response, RESPONSE_LIMIT_BYTES);
+    const body = await readBoundedResponseBody(
+      response,
+      controller.signal,
+      (code) => new Error(code),
+    );
     let payload: unknown;
     try {
-      payload = JSON.parse(text);
+      payload = JSON.parse(
+        new TextDecoder("utf-8", { fatal: true }).decode(body),
+      );
     } catch {
       throw new Error("malformed_json");
     }
@@ -362,6 +465,25 @@ async function probeMinimax(
         );
       }
     }
+    if (balance) {
+      const root = objectValue(payload);
+      const data = objectValue(root?.data) ?? root;
+      const raw = data?.available_amount;
+      const remaining =
+        typeof raw === "string" && raw.trim()
+          ? numericValue(Number(raw))
+          : numericValue(raw);
+      if (remaining === undefined) throw new Error("malformed_json");
+      return {
+        windows: [],
+        untrustedWindowIds: [],
+        credits: {
+          remaining,
+          unit:
+            new URL(baseUrl).hostname === "api.minimaxi.com" ? "cny" : "usd",
+        },
+      };
+    }
     return normalizeMinimaxProbe(payload);
   } catch (error) {
     if (controller.signal.aborted) {
@@ -374,6 +496,7 @@ async function probeMinimax(
         "provider_rate_limited",
         "provider_request_rejected",
         "response_too_large",
+        "response_size_unverifiable",
         "malformed_json",
         "provider_timeout",
       ].includes(error.message)
@@ -409,6 +532,7 @@ function normalizeMinimaxProbe(raw: unknown): NormalizedMinimaxProbe {
         total: "current_interval_total_count",
         usage: "current_interval_usage_count",
         remaining: "current_interval_remain_count",
+        startsAt: "start_time",
         resetsAt: ["end_time", "current_interval_end_time"],
         remainsTime: "remains_time",
       },
@@ -420,6 +544,7 @@ function normalizeMinimaxProbe(raw: unknown): NormalizedMinimaxProbe {
         total: "current_weekly_total_count",
         usage: "current_weekly_usage_count",
         remaining: "current_weekly_remain_count",
+        startsAt: "weekly_start_time",
         resetsAt: ["weekly_end_time"],
         remainsTime: "weekly_remains_time",
       },
@@ -431,17 +556,24 @@ function normalizeMinimaxProbe(raw: unknown): NormalizedMinimaxProbe {
         continue;
       }
       if (!measurement) continue;
-      const resetsAt = parseEpochOrIso(
+      const resetsAt = minimaxTimestamp(
         period.resetsAt
           .map((field) => model[field])
           .find((value) => value != null),
       );
+      const parsedStart = minimaxTimestamp(model[period.startsAt]);
+      const startsAt =
+        parsedStart &&
+        (!resetsAt || Date.parse(parsedStart) < Date.parse(resetsAt))
+          ? parsedStart
+          : undefined;
       const resetText = remainsText(model[period.remainsTime]);
       windows.push({
         id,
         label: `${name} ${period.label}`,
         kind: period.kind,
         ...measurement,
+        ...(startsAt ? { startsAt } : {}),
         ...(resetsAt ? { resetsAt } : {}),
         ...(resetText ? { resetText } : {}),
       });
@@ -462,6 +594,7 @@ type MinimaxPeriod = {
   total: string;
   usage: string;
   remaining: string;
+  startsAt: string;
   resetsAt: readonly string[];
   remainsTime: string;
 };
@@ -513,6 +646,17 @@ function minimaxMeasurement(
   return { percentUsed: 100 - percentRemaining, percentRemaining };
 }
 
+function minimaxTimestamp(value: unknown): string | undefined {
+  const timestamp = parseEpochOrIso(
+    typeof value === "string" && value.trim() && Number.isFinite(Number(value))
+      ? Number(value)
+      : value,
+  );
+  return timestamp && Number.isFinite(Date.parse(timestamp))
+    ? timestamp
+    : undefined;
+}
+
 function remainsText(value: unknown): string | undefined {
   const milliseconds = numericValue(value);
   if (milliseconds === undefined || milliseconds < 0) return undefined;
@@ -543,6 +687,7 @@ function successMinimaxReport(
     label: LABEL,
     source: "api",
     windows: probe.windows,
+    ...(probe.credits ? { credits: probe.credits } : {}),
     refreshedAt: new Date(dependencies.now()).toISOString(),
     sourcesTried: sourceNames(attempts),
     attempts,

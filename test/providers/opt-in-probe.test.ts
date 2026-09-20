@@ -8,7 +8,10 @@ import {
   extractMinimaxCredential,
 } from "../../src/providers/minimax.js";
 
-vi.mock("../../src/lib/http.js", () => ({ providerFetch: vi.fn() }));
+vi.mock("../../src/lib/http.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../src/lib/http.js")>()),
+  providerFetch: vi.fn(),
+}));
 
 const OPTIONS = { allowKeychainPrompt: false, refreshCredentials: false };
 let directory: string;
