@@ -129,13 +129,6 @@ async function fetchQuota(dependencies: Dependencies): Promise<ProviderQuota> {
         dependencies.deadlineMs,
       );
       const normalized = normalizeOpenRouterPayload(payload);
-      // The key endpoint already proved this credential, so a credits read
-      // that fails can only leave the balance unknown - it never downgrades
-      // the reading or becomes an auth verdict.
-      const balance = await readOpenRouterCreditsBalance(
-        resolution.key,
-        dependencies,
-      );
       attempts.push({ source: resolution.source, status: "success" });
 
       const windows: QuotaWindow[] = [];
@@ -171,7 +164,7 @@ async function fetchQuota(dependencies: Dependencies): Promise<ProviderQuota> {
       const creditRemaining =
         !normalized.unlimited && normalized.remaining !== undefined
           ? normalized.remaining
-          : balance;
+          : await readOpenRouterCreditsBalance(resolution.key, dependencies);
 
       return successProvider({
         provider: "openrouter",

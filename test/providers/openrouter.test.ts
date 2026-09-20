@@ -76,16 +76,12 @@ describe("OpenRouter provider", () => {
       }),
     ]);
     expect(JSON.stringify(report)).not.toContain(KEY);
-    expect(request).toHaveBeenCalledTimes(2);
+    expect(request).toHaveBeenCalledTimes(1);
     expect(String(request.mock.calls[0][0])).toBe(OPENROUTER_KEY_URL);
     const init = request.mock.calls[0][1];
     expect(new Headers(init?.headers).get("authorization")).toBe(
       "Bearer " + KEY,
     );
-    expect(String(request.mock.calls[1][0])).toBe(OPENROUTER_CREDITS_URL);
-    expect(
-      new Headers(request.mock.calls[1][1]?.headers).get("authorization"),
-    ).toBe("Bearer " + KEY);
   });
 
   it("tries Pi auth after an environment key is rejected", async () => {
@@ -126,8 +122,7 @@ describe("OpenRouter provider", () => {
       ],
       credits: { remaining: 40, unit: "usd" },
     });
-    // env key rejected, then the Pi key's key + credits reads.
-    expect(request).toHaveBeenCalledTimes(3);
+    expect(request).toHaveBeenCalledTimes(2);
   });
 
   it("reports the purchased-credit balance when the key has no spend cap", async () => {
@@ -163,7 +158,11 @@ describe("OpenRouter provider", () => {
       credits: { remaining: 118.5, unit: "usd" },
     });
     expect(JSON.stringify(report)).not.toContain("unlimited");
+    expect(request).toHaveBeenCalledTimes(2);
     expect(String(request.mock.calls[1][0])).toBe(OPENROUTER_CREDITS_URL);
+    expect(
+      new Headers(request.mock.calls[1][1]?.headers).get("authorization"),
+    ).toBe("Bearer " + KEY);
   });
 
   it("never claims unlimited when a capless key's balance is unreadable", async () => {
@@ -272,6 +271,7 @@ describe("OpenRouter provider", () => {
       }),
     ]);
     expect(report.credits).toEqual({ remaining: -5, unit: "usd" });
+    expect(request).toHaveBeenCalledTimes(1);
   });
 
   it("reports a zero finite cap as fully spent", async () => {
@@ -298,6 +298,7 @@ describe("OpenRouter provider", () => {
       }),
     ]);
     expect(report.credits).toEqual({ remaining: 0, unit: "usd" });
+    expect(request).toHaveBeenCalledTimes(1);
   });
 
   it("rejects an invalid payload", () => {
