@@ -13,10 +13,7 @@ import {
   defaultMinimaxCredentialSources,
   extractMinimaxCredential,
   opencodeAuthFilePath,
-  minimaxConfigPath,
 } from "../../src/providers/minimax.js";
-
-import { computeWindowPace } from "../../src/pace.js";
 
 const OPTIONS = { allowKeychainPrompt: false, refreshCredentials: false };
 const KEY = "synthetic-minimax-key-42";
@@ -41,8 +38,6 @@ beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), "quota-axi-minimax-"));
   process.env.XDG_DATA_HOME = join(tempDir, "data");
   process.env.PI_CODING_AGENT_DIR = join(tempDir, "pi-agent");
-  process.env.MMX_CONFIG_DIR = join(tempDir, "mmx");
-  delete process.env.MINIMAX_BASE_URL;
   delete process.env.MINIMAX_API_KEY;
   if (process.platform === "win32")
     process.env.LOCALAPPDATA = join(tempDir, "local");
@@ -79,125 +74,43 @@ function jsonResponse(body: unknown, status = 200): Response {
 }
 
 describe("MiniMax provider", () => {
-  it.each([
-    [{ api_key: KEY }, "https://api.minimax.io/v1/token_plan/remains"],
-    [
-      { api_key: KEY, region: "cn" },
-      "https://api.minimaxi.com/v1/token_plan/remains",
-    ],
-    [
-      { api_key: KEY, base_url: "https://api.minimaxi.com" },
-      "https://api.minimaxi.com/v1/token_plan/remains",
-    ],
-    [
-      {
-        oauth: { access_token: KEY, resource_url: "https://api.minimaxi.com" },
-      },
-      "https://api.minimaxi.com/v1/token_plan/remains",
-    ],
-  ])(
-    "reads native CLI credentials with their deployment: %j",
-    async (config, url) => {
-      mkdirSync(process.env.MMX_CONFIG_DIR!, { recursive: true });
-      writeFileSync(minimaxConfigPath(), JSON.stringify(config));
-      const request = vi.fn(async () => jsonResponse(CODING_PLAN_REMAINS));
-      const adapter = createMinimaxAdapter({ fetch: request });
-      const report = await adapter.fetchQuota(OPTIONS);
-      expect(request).toHaveBeenCalledOnce();
-      expect(String(request.mock.calls[0]?.[0])).toBe(url);
-      expect(
-        new Headers(request.mock.calls[0]?.[1]?.headers).get("authorization"),
-      ).toBe(`Bearer ${KEY}`);
-      expect(report.windows).toHaveLength(2);
-      expect((await adapter.inspectAuth(OPTIONS)).sources).toContainEqual({
-        source: "minimax:config.json",
-        path: minimaxConfigPath(),
-        status: "available",
-      });
-      expect(JSON.stringify(report)).not.toContain(KEY);
-    },
-  );
-
-  it.each([
-    ["https://api.minimax.io", "usd"],
-    ["https://api.minimaxi.com", "cny"],
-  ])("reads pay-as-you-go balances from %s", async (base, unit) => {
-    process.env.MINIMAX_BASE_URL = base;
-    const request = vi.fn(async () =>
-      jsonResponse({ data: { available_amount: "12.34" } }),
+  it("ignores native CLI credentials outside its source set", async () => {
+    process.env.MMX_CONFIG_DIR = join(tempDir, "mmx");
+    mkdirSync(process.env.MMX_CONFIG_DIR, { recursive: true });
+    writeFileSync(
+      join(process.env.MMX_CONFIG_DIR, "config.json"),
+      JSON.stringify({
+        api_key: KEY,
+        oauth: { access_token: KEY },
+      }),
     );
+    const request = vi.fn(async () => jsonResponse(CODING_PLAN_REMAINS));
+    const adapter = createMinimaxAdapter({ fetch: request });
+    const report = await adapter.fetchQuota(OPTIONS);
+    expect(request).not.toHaveBeenCalled();
+    expect(report.state.status).toBe("auth_required");
+    expect(
+      (await adapter.inspectAuth(OPTIONS)).sources.map(
+        (source) => source.source,
+      ),
+    ).toEqual(["MINIMAX_API_KEY", "opencode:auth.json", "pi:minimax"]);
+  });
+
+  it("keeps the global Coding Plan endpoint for explicitly supplied keys", async () => {
+    process.env.MINIMAX_BASE_URL = "https://api.minimaxi.com";
+    const request = vi.fn(async () => jsonResponse(CODING_PLAN_REMAINS));
     const report = await createMinimaxAdapter({
       envApiKey: () => "sk-api-synthetic",
       credentialSources: [],
       fetch: request,
     }).fetchQuota(OPTIONS);
+    expect(request).toHaveBeenCalledOnce();
     expect(String(request.mock.calls[0]?.[0])).toBe(
-      `${base}/account/query_balance`,
+      "https://api.minimax.io/v1/api/openplatform/coding_plan/remains",
     );
-    expect(report.credits).toEqual({ remaining: 12.34, unit });
-    expect(report.windows).toEqual([]);
+    expect(report.windows).toHaveLength(2);
+    expect(report.credits).toBeUndefined();
   });
-
-  it("uses the China quota endpoint selected by the environment", async () => {
-    process.env.MINIMAX_BASE_URL = "https://api.minimaxi.com";
-    const request = vi.fn(async () => jsonResponse(CODING_PLAN_REMAINS));
-    await createMinimaxAdapter({
-      envApiKey: () => KEY,
-      credentialSources: [],
-      fetch: request,
-    }).fetchQuota(OPTIONS);
-    expect(String(request.mock.calls[0]?.[0])).toBe(
-      "https://api.minimaxi.com/v1/token_plan/remains",
-    );
-  });
-
-  it("retains supplied cycle starts for per-window pace", async () => {
-    const payload = JSON.parse(
-      readFileSync("test/fixtures/minimax/quota.json", "utf8"),
-    );
-    const report = await createMinimaxAdapter({
-      envApiKey: () => KEY,
-      credentialSources: [],
-      fetch: async () => jsonResponse(payload),
-    }).fetchQuota(OPTIONS);
-    expect(report.windows).toHaveLength(4);
-    for (const window of report.windows) {
-      expect(window.startsAt).toBe(
-        new Date(
-          window.kind === "weekly" ? 1787688000000 : 1788264000000,
-        ).toISOString(),
-      );
-      const pace = computeWindowPace(
-        window,
-        new Date(1788273000000).toISOString(),
-      );
-      expect(pace.reason).not.toBe("missing_cycle");
-      expect(pace.cycleSeconds).toBe(window.kind === "weekly" ? 604800 : 18000);
-    }
-  });
-
-  it.each(["invalid", "2026-09-01T15:00:00Z"])(
-    "omits invalid or reversed cycle start %s",
-    async (start) => {
-      const report = await createMinimaxAdapter({
-        envApiKey: () => KEY,
-        credentialSources: [],
-        fetch: async () =>
-          jsonResponse({
-            model_remains: [
-              {
-                model_name: "general",
-                current_interval_remaining_percent: 50,
-                start_time: start,
-                end_time: "2026-09-01T14:00:00Z",
-              },
-            ],
-          }),
-      }).fetchQuota(OPTIONS);
-      expect(report.windows[0]?.startsAt).toBeUndefined();
-      expect(report.windows[0]?.percentRemaining).toBe(50);
-    },
-  );
 
   it("extracts a literal key under the canonical provider ids", () => {
     expect(
@@ -740,7 +653,6 @@ describe("MiniMax provider", () => {
       "MINIMAX_API_KEY",
       "opencode:auth.json",
       "pi:minimax",
-      "minimax:config.json",
     ]);
     const opencodeSource = report.sources.find(
       (source) => source.source === "opencode:auth.json",
@@ -755,7 +667,7 @@ describe("MiniMax provider", () => {
   it("respects a custom credential source list, keeping its order", () => {
     expect(
       defaultMinimaxCredentialSources().map((source) => source.name),
-    ).toEqual(["opencode:auth.json", "pi:minimax", "minimax:config.json"]);
+    ).toEqual(["opencode:auth.json", "pi:minimax"]);
   });
 
   it("never logs the bearer, even when the upstream returns an error that mentions it", async () => {
