@@ -1375,7 +1375,10 @@ describe("new provider public quota output", () => {
     process.env.PI_CODING_AGENT_DIR = join(tempDir!, "pi-agent");
     process.env.XDG_DATA_HOME = join(tempDir!, "data");
     mkdirSync(join(process.env.XDG_DATA_HOME, "opencode"), { recursive: true });
-    writeFileSync(join(process.env.XDG_DATA_HOME, "opencode", "auth.json"), "{}");
+    writeFileSync(
+      join(process.env.XDG_DATA_HOME, "opencode", "auth.json"),
+      "{}",
+    );
     mkdirSync(process.env.PI_CODING_AGENT_DIR, { recursive: true });
     writeFileSync(
       join(process.env.PI_CODING_AGENT_DIR, "auth.json"),
