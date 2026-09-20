@@ -59,9 +59,9 @@ const CREDENTIAL_CONTEXT_ID = /^[a-f0-9]{64}$/;
  * cache slot alone does not say: a Claude profile selects the credential store,
  * a Kimi Code `config.toml` selects the deployment, Command Code's `whoami`
  * identifies the source-plus-account pair, an ElevenLabs API key is itself the
- * account, and a
- * Codex slot can be signed in to another ChatGPT account. A snapshot from one
- * such context says nothing about another, so each is stamped on write and
+ * account, and a Codex slot can be signed in to another ChatGPT account. A
+ * snapshot from one such context says nothing about another, so each is stamped
+ * on write and
  * checked on stale reuse - strictly for Claude, Kimi, Command Code,
  * and ElevenLabs, whose identity a reading always has (and which skip write
  * and clear when that identity is missing), and on proven mismatch for Codex,
@@ -80,8 +80,7 @@ const CREDENTIAL_CONTEXT_ID = /^[a-f0-9]{64}$/;
  * can only name the accounts the credentials still store, so the stamp is the
  * stored id of the one credential that answered (not the vendor's response id,
  * which can differ while the token is the same) hashed because the cache holds
- * no account identity in the clear. MiniMax publishes the answering credential
- * source plus the deployment host its resolution implies. ElevenLabs publishes
+ * no account identity in the clear. ElevenLabs publishes
  * a one-way digest of the key that answered, because that key is the only thing
  * naming the subscription and its single slot would otherwise be shared by
  * every key.

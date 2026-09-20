@@ -45,6 +45,7 @@ const originalDeepSeekApiKey = process.env.DEEPSEEK_API_KEY;
 const originalOpenRouterApiKey = process.env.OPENROUTER_API_KEY;
 const originalPiCodingAgentDir = process.env.PI_CODING_AGENT_DIR;
 const originalMmxConfigDir = process.env.MMX_CONFIG_DIR;
+const originalXdgDataHome = process.env.XDG_DATA_HOME;
 let tempDir: string | undefined;
 
 afterEach(() => {
@@ -74,6 +75,7 @@ afterEach(() => {
   restoreEnvironment("OPENROUTER_API_KEY", originalOpenRouterApiKey);
   restoreEnvironment("PI_CODING_AGENT_DIR", originalPiCodingAgentDir);
   restoreEnvironment("MMX_CONFIG_DIR", originalMmxConfigDir);
+  restoreEnvironment("XDG_DATA_HOME", originalXdgDataHome);
   if (tempDir) rmSync(tempDir, { recursive: true, force: true });
   tempDir = undefined;
   process.exitCode = undefined;
@@ -81,7 +83,7 @@ afterEach(() => {
 });
 
 describe("CLI flag parsing", () => {
-  it("defaults to all supported providers", () => {
+  it("defaults to providers without opt-in adapters", () => {
     expect(parseFlags([]).providers).toEqual([
       "claude",
       "codex",
@@ -94,7 +96,6 @@ describe("CLI flag parsing", () => {
       "alibaba",
       "opencode-go",
       "commandcode",
-      "minimax",
       "mimo",
       "deepseek",
       "openrouter",
@@ -137,7 +138,6 @@ describe("CLI flag parsing", () => {
           "alibaba",
           "opencode-go",
           "commandcode",
-          "minimax",
           "mimo",
           "deepseek",
           "openrouter",
@@ -1263,17 +1263,17 @@ describe("CLI quota rendering", () => {
 });
 
 describe("new provider public quota output", () => {
-  it("renders registered MiniMax model scopes through the JSON CLI", async () => {
+  it("renders registered MiniMax meters without inventing model bounds through the JSON CLI", async () => {
     useTempCache();
     const key = "synthetic-minimax-cli-key";
     process.env.MINIMAX_API_KEY = key;
     const payload = JSON.parse(
-      readFileSync("test/fixtures/minimax/quota.json", "utf8"),
+      readFileSync("test/fixtures/minimax/coding-plan-remains.json", "utf8"),
     );
     const fetch = vi.fn(
       async (input: RequestInfo | URL, init?: RequestInit) => {
         expect(String(input)).toBe(
-          "https://api.minimax.io/v1/token_plan/remains",
+          "https://api.minimax.io/v1/api/openplatform/coding_plan/remains",
         );
         expect(new Headers(init?.headers).get("authorization")).toBe(
           `Bearer ${key}`,
@@ -1298,38 +1298,24 @@ describe("new provider public quota output", () => {
       state: {
         status: "fresh",
         stale: false,
-        sourcesTried: ["env:MINIMAX_API_KEY"],
+        sourcesTried: ["MINIMAX_API_KEY"],
       },
-      attempts: [{ source: "env:MINIMAX_API_KEY", status: "success" }],
+      attempts: [{ source: "MINIMAX_API_KEY", status: "success" }],
     });
     expect(provider?.windows).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
-          id: "model:minimax-m3:5h",
-          percentRemaining: 91,
-          windowSeconds: 18_000,
+          id: "model:general:interval",
+          percentRemaining: 73,
         }),
         expect.objectContaining({
-          id: "model:minimax-m3:7d",
-          percentRemaining: 70,
-          windowSeconds: 604_800,
+          id: "model:general:weekly",
+          percentRemaining: 97,
         }),
       ]),
     );
-    expect(provider?.quotaSemantics?.effectiveAvailability).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          scope: "model:minimax-m3",
-          status: "known",
-          effectivePercentRemaining: 70,
-        }),
-        expect.objectContaining({
-          scope: "model:minimax-m2.7-highspeed",
-          status: "known",
-          effectivePercentRemaining: 50,
-        }),
-      ]),
-    );
+    expect(provider?.quotaSemantics?.status).toBe("unknown");
+    expect(provider?.quotaSemantics?.effectiveAvailability).toEqual([]);
     expect(JSON.stringify(json)).not.toContain(key);
   });
 
@@ -1387,7 +1373,9 @@ describe("new provider public quota output", () => {
     useTempCache();
     delete process.env.MINIMAX_API_KEY;
     process.env.PI_CODING_AGENT_DIR = join(tempDir!, "pi-agent");
-    process.env.MMX_CONFIG_DIR = join(tempDir!, "mmx");
+    process.env.XDG_DATA_HOME = join(tempDir!, "data");
+    mkdirSync(join(process.env.XDG_DATA_HOME, "opencode"), { recursive: true });
+    writeFileSync(join(process.env.XDG_DATA_HOME, "opencode", "auth.json"), "{}");
     mkdirSync(process.env.PI_CODING_AGENT_DIR, { recursive: true });
     writeFileSync(
       join(process.env.PI_CODING_AGENT_DIR, "auth.json"),
@@ -1404,17 +1392,17 @@ describe("new provider public quota output", () => {
         provider: "minimax",
         sources: [
           expect.objectContaining({
-            source: "env:MINIMAX_API_KEY",
+            source: "MINIMAX_API_KEY",
+            status: "missing",
+          }),
+          expect.objectContaining({
+            source: "opencode:auth.json",
             status: "missing",
           }),
           expect.objectContaining({
             source: "pi:minimax",
             status: "invalid",
-            error: "credential_missing",
-          }),
-          expect.objectContaining({
-            source: "minimax:config.json",
-            status: "missing",
+            error: "invalid_credential",
           }),
         ],
       }),
@@ -1601,7 +1589,6 @@ describe("default TOON decision blocks", () => {
       "grok",
       "kimi",
       "mimo",
-      "minimax",
       "opencode-go",
       "openrouter",
       "zai",

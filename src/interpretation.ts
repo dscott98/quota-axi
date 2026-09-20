@@ -166,7 +166,7 @@ function semanticsFor(
     case "minimax":
       return unknownSemantics(
         provider.windows,
-        "MiniMax does not publish per-window reset or bound evidence, so effective remaining percentage stays unknown.",
+        "MiniMax publishes per-model Coding Plan meters but does not establish whether those meters are independent or jointly bound, so effective remaining percentage stays unknown.",
       );
     case "mimo":
       return unknownSemantics(
