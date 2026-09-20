@@ -6,9 +6,9 @@ import * as path from "node:path";
 /**
  * Run a command and resolve its stdout as text. On failure the rejection is
  * Node's own error (message preserved for existing consumers) enriched with
- * `commandStdout`/`commandStderr`, because modern Node no longer exposes
- * `error.stdout`/`error.stderr` and a vendor CLI's structured error body
- * arrives on stderr (observed: Alibaba `bl` exit 3 with a JSON error).
+ * `commandStdout`/`commandStderr` from the callback outputs, so callers can
+ * parse vendor error bodies without relying on fields on Node's error or
+ * extracting them from its combined command-failure message.
  */
 export function execFileText(
   command: string,

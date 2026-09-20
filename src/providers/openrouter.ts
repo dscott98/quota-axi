@@ -304,8 +304,7 @@ async function readOpenRouterCreditsBalance(
     const credits = normalizeOpenRouterCredits(payload);
     if (credits.purchased === undefined || credits.used === undefined)
       return undefined;
-    // Overage rounds to a spent balance; a negative figure would claim the
-    // account owes headroom it does not have.
+    // Clamp overage to zero without rounding away sub-cent credit.
     return Math.max(0, credits.purchased - credits.used);
   } catch {
     return undefined;
