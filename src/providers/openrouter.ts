@@ -306,10 +306,7 @@ async function readOpenRouterCreditsBalance(
       return undefined;
     // Overage rounds to a spent balance; a negative figure would claim the
     // account owes headroom it does not have.
-    return Math.max(
-      0,
-      Math.round((credits.purchased - credits.used) * 100) / 100,
-    );
+    return Math.max(0, credits.purchased - credits.used);
   } catch {
     return undefined;
   }

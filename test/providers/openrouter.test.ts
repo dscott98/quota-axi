@@ -207,6 +207,30 @@ describe("OpenRouter provider", () => {
     ).toThrow("invalid_payload");
   });
 
+  it.each([9.996, 9.994])(
+    "preserves sub-cent credit balances with usage %s",
+    async (usage) => {
+      const request = urlAwareFetch(
+        () => jsonResponse({ data: { limit: null } }),
+        () => jsonResponse({ data: { total_credits: 10, total_usage: usage } }),
+      );
+
+      const report = await createOpenRouterAdapter({
+        credential: () => ({
+          status: "available",
+          key: KEY,
+          source: "env:OPENROUTER_API_KEY",
+        }),
+        fetch: request,
+      }).fetchQuota(OPTIONS);
+
+      expect(report.state.status).toBe("fresh");
+      expect(report.credits).toEqual({ remaining: 10 - usage, unit: "usd" });
+      expect(report.credits?.remaining).toBeGreaterThan(0);
+      expect(report.credits?.remaining).toBeLessThan(0.01);
+    },
+  );
+
   it("clamps a negative credit balance to zero", async () => {
     const request = urlAwareFetch(
       () => jsonResponse({ data: { limit: null } }),
