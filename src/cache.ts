@@ -9,7 +9,6 @@ import {
 import { kimiReadingContextId } from "./providers/kimi-cache-context.js";
 import { commandCodeReadingContextId } from "./providers/commandcode-cache-context.js";
 import { elevenLabsReadingContextId } from "./providers/elevenlabs-cache-context.js";
-import { miniMaxReadingContextId } from "./providers/minimax-cache-context.js";
 import { isPiCodexSource } from "./providers/pi-codex-credential.js";
 import type {
   ProviderId,
@@ -60,10 +59,10 @@ const CREDENTIAL_CONTEXT_ID = /^[a-f0-9]{64}$/;
  * cache slot alone does not say: a Claude profile selects the credential store,
  * a Kimi Code `config.toml` selects the deployment, Command Code's `whoami`
  * identifies the source-plus-account pair, an ElevenLabs API key is itself the
- * account, MiniMax stamps by credential source plus deployment host, and a
+ * account, and a
  * Codex slot can be signed in to another ChatGPT account. A snapshot from one
  * such context says nothing about another, so each is stamped on write and
- * checked on stale reuse - strictly for Claude, Kimi, Command Code, MiniMax,
+ * checked on stale reuse - strictly for Claude, Kimi, Command Code,
  * and ElevenLabs, whose identity a reading always has (and which skip write
  * and clear when that identity is missing), and on proven mismatch for Codex,
  * whose stored account id is optional.
@@ -95,7 +94,6 @@ const CONTEXT_SCOPED_PROVIDERS: Partial<
   commandcode: commandCodeReadingContextId,
   elevenlabs: elevenLabsReadingContextId,
   codex: codexStampContextId,
-  minimax: miniMaxReadingContextId,
 };
 
 /**
@@ -212,17 +210,6 @@ export function readCachedCommandCodeProvider(
   contextId: string,
 ): ProviderQuota | undefined {
   return readCachedProviderInContext("commandcode", contextId);
-}
-
-/**
- * MiniMax stale quota may only be reused when the cache record proves it was
- * captured from the same credential source and deployment host the caller is
- * asking about.
- */
-export function readCachedMiniMaxProvider(
-  contextId: string,
-): ProviderQuota | undefined {
-  return readCachedProviderInContext("minimax", contextId);
 }
 
 /**
@@ -376,7 +363,7 @@ function toCacheProvider(provider: ProviderQuota): CachedProvider | undefined {
   )?.snapshot;
   if (!snapshot) return undefined;
   const contextId = CONTEXT_SCOPED_PROVIDERS[provider.provider]?.(provider);
-  // Claude, Kimi, Command Code, MiniMax, and ElevenLabs require a published
+  // Claude, Kimi, Command Code, and ElevenLabs require a published
   // identity; Codex stamps are optional and withheld only on proven mismatch
   // at read time.
   if (
@@ -392,7 +379,7 @@ function toCacheProvider(provider: ProviderQuota): CachedProvider | undefined {
 }
 
 function missingRequiredContext(provider: ProviderId): boolean {
-  // Codex stamps are optional; Claude, Kimi, Command Code, MiniMax, and
+  // Codex stamps are optional; Claude, Kimi, Command Code, and
   // ElevenLabs must
   // not clear when the current reading has no published context identity.
   if (provider === "codex") return false;
