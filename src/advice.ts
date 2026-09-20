@@ -10,6 +10,10 @@ export const KEYCHAIN_ACCESS_REMEDY_COMMAND =
   "quota-axi --allow-keychain-prompt";
 export const CREDENTIALS_EXPIRED_REASON = "credentials_expired";
 export const GROK_TOKEN_REFRESH_REMEDY_COMMAND = "grok";
+export const INFERENCE_OPT_IN_REASON = "inference_opt_in_required";
+export const CLAUDE_INFERENCE_REMEDY_COMMAND =
+  "quota-axi --provider claude --allow-claude-inference";
+const CLAUDE_ENV_SCOPE_DENIAL_ERROR = "claude_env_usage_scope_unavailable";
 
 export function annotateQuotaAdvice(
   response: Omit<QuotaAxiResponse, "schemaVersion">,
@@ -43,6 +47,16 @@ export function quotaHelpLines(response: QuotaAxiResponse): string[] {
 }
 
 function annotateProviderAdvice(provider: ProviderQuota): ProviderQuota {
+  if (needsClaudeInferenceAdvice(provider)) {
+    return {
+      ...provider,
+      state: {
+        ...provider.state,
+        reason: INFERENCE_OPT_IN_REASON,
+        remedyCommand: CLAUDE_INFERENCE_REMEDY_COMMAND,
+      },
+    };
+  }
   if (needsKeychainAccessAdvice(provider)) {
     return {
       ...provider,
@@ -66,10 +80,52 @@ function annotateProviderAdvice(provider: ProviderQuota): ProviderQuota {
   return provider;
 }
 
+/**
+ * The env token's exact `user:profile` scope denial leaves a usable session
+ * with no numeric quota. It is checked ahead of Keychain advice because the
+ * env token is consulted first and that denial ends discovery, so a stored
+ * Keychain grant could never have helped this reading. A run that already
+ * attempted the native fallback reports that fallback's own error instead, so
+ * the exact error equality alone keeps an enabled run from re-advertising it.
+ */
+function needsClaudeInferenceAdvice(provider: ProviderQuota): boolean {
+  return (
+    provider.provider === "claude" &&
+    provider.state.status !== "fresh" &&
+    provider.state.error === CLAUDE_ENV_SCOPE_DENIAL_ERROR &&
+    envScopeDenialEndedDiscovery(provider.attempts ?? [])
+  );
+}
+
+/**
+ * The env token is consulted first and its exact scope denial ends discovery,
+ * so no stored source was consulted on that reading and a Keychain grant could
+ * not have changed it - whether the denial itself or a later native fallback
+ * failure ended up as the report's error.
+ */
+function envScopeDenialEndedDiscovery(attempts: SourceAttempt[]): boolean {
+  return attempts.some(
+    (attempt) =>
+      attempt.source === "env" &&
+      attempt.status === "failed" &&
+      attempt.error === CLAUDE_ENV_SCOPE_DENIAL_ERROR,
+  );
+}
+
 function needsKeychainAccessAdvice(provider: ProviderQuota): boolean {
   const attempts = provider.attempts ?? [];
   return (
     provider.state.status !== "fresh" &&
+    !envScopeDenialEndedDiscovery(attempts) &&
+    !(
+      provider.provider === "claude" &&
+      attempts.some(
+        (attempt) =>
+          attempt.source === "env" &&
+          attempt.status === "failed" &&
+          attempt.error === "Claude sign-in required",
+      )
+    ) &&
     !attempts.some(isCredentialSourceReading) &&
     attempts.some(isBlockedCredentialAttempt) &&
     attempts.some(isPromptBlockedKeychainAttempt)
@@ -137,7 +193,15 @@ function providerHelpLines(provider: ProviderQuota): string[] {
   if (hasKeychainAccessAdvice(provider))
     return [keychainAccessHelpLine(provider)];
   if (hasGrokTokenRefreshAdvice(provider)) return [grokTokenRefreshHelpLine()];
+  if (hasClaudeInferenceAdvice(provider)) return [claudeInferenceHelpLine()];
   return [];
+}
+
+function hasClaudeInferenceAdvice(provider: ProviderQuota): boolean {
+  return (
+    provider.state.reason === INFERENCE_OPT_IN_REASON &&
+    provider.state.remedyCommand === CLAUDE_INFERENCE_REMEDY_COMMAND
+  );
 }
 
 function hasKeychainAccessAdvice(provider: ProviderQuota): boolean {
@@ -156,6 +220,10 @@ function hasGrokTokenRefreshAdvice(provider: ProviderQuota): boolean {
 
 function keychainAccessHelpLine(provider: ProviderQuota): string {
   return `Tell your user: run \`${KEYCHAIN_ACCESS_REMEDY_COMMAND}\` once and approve Keychain access ("Always Allow") so quota-axi can read ${provider.provider}'s live quota.`;
+}
+
+function claudeInferenceHelpLine(): string {
+  return `Tell your user: the CLAUDE_CODE_OAUTH_TOKEN session is usable but its token cannot read the quota endpoint. Running \`${CLAUDE_INFERENCE_REMEDY_COMMAND}\` once reads its five-hour and seven-day quota by spending one bounded native Claude Code startup plus a small inference request; quota-axi never does this by default.`;
 }
 
 function grokTokenRefreshHelpLine(): string {

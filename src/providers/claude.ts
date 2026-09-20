@@ -46,6 +46,7 @@ import {
   type RefreshDelegate,
 } from "./delegated-refresh.js";
 import { withUsageFetchFailure } from "./usage-fetch-failure.js";
+import { fetchClaudeNativeQuota } from "./claude-native-quota.js";
 
 const API_URL = "https://api.anthropic.com/api/oauth/usage";
 const PROFILE_API_URL = "https://api.anthropic.com/api/oauth/profile";
@@ -141,6 +142,9 @@ type ClaudeFailureOptions = {
   definitiveAuth?: boolean;
   staleEligible?: boolean;
   retryAfter?: string;
+  authUsable?: boolean;
+  envProfileScopeDenied?: boolean;
+  windows?: QuotaWindow[];
 };
 
 // A scoped-limit entry as returned in the `limits` array of the OAuth usage
@@ -481,16 +485,26 @@ async function liveClaudeRefreshBlocker(): Promise<string | undefined> {
  * command line. The PID check in the caller is essential because quota-axi's
  * own argv may contain a standalone `claude` provider argument.
  *
- * The installed
- * `claude` executable (native installer or a versioned shim) or the npm
- * package running under a Node runtime. Every whitespace-separated token is
- * checked rather than only the first, because a `ps` command line splits an
- * installation path that contains a space. Matching is deliberately generous -
- * over-matching only means quota-axi stays read-only, which is the safe side.
+ * Matches the installed `claude` executable (native installer or a versioned
+ * shim) and the npm package running under a Node runtime. The executable is
+ * argv[0], so a token whose basename is `claude` names it only in that
+ * position: either the first token (a bare `claude` resolved on PATH) or a
+ * later path fragment when an installation path contains a space and `ps`
+ * splits it across tokens. A bare `claude` token inside another process's
+ * arguments is ordinary prose, not a session, and must not stand the refresh
+ * down.
  */
 function isLiveClaudeCodeProcess(commandLine: string): boolean {
   const tokens = commandLine.split(/\s+/);
-  if (tokens.some((token) => token.split("/").pop() === "claude")) return true;
+  if (
+    tokens.some(
+      (token, index) =>
+        token.split("/").pop() === "claude" &&
+        (index === 0 || token.includes("/")),
+    )
+  ) {
+    return true;
+  }
   return commandLine.includes("@anthropic-ai/claude-code/");
 }
 
@@ -583,8 +597,8 @@ async function attemptClaudeQuota(
       source: state.source.source,
       status: "skipped",
       error: `credentials_${state.status}`,
-      // A malformed store still holds a credential, so a sibling source that
-      // answers supersedes it rather than replacing it silently.
+      // A malformed store is not confirmed absent; retain its diagnostic
+      // even when a sibling source answers.
       ...(state.status === "invalid" ? { credentialPresent: true } : {}),
     });
   }
@@ -627,6 +641,49 @@ async function attemptClaudeQuota(
           status: "failed",
           error: failure.code,
         };
+        if (credential.source === "env" && failure.envProfileScopeDenied) {
+          attempts[attempts.length - 1]!.degraded = false;
+          if (options.allowClaudeInference) {
+            attempts.push({
+              source: "claude-native-inference",
+              status: "failed",
+            });
+            const native = await fetchClaudeNativeQuota();
+            if (native.kind === "success") {
+              attempts[attempts.length - 1] = {
+                source: "claude-native-inference",
+                status: "success",
+              };
+              const report = successProvider({
+                provider: "claude",
+                label: "Claude",
+                source: "cli",
+                windows: native.windows,
+                refreshedAt: native.refreshedAt,
+                sourcesTried: sourceNames(attempts),
+                attempts,
+              });
+              report.state.authStatus = "usable";
+              return { kind: "success", report };
+            }
+            attempts[attempts.length - 1] = {
+              source: "claude-native-inference",
+              status: "failed",
+              error: native.error,
+              degraded: false,
+            };
+            transientFailure = new ClaudeFailure(native.error, {
+              status: native.status,
+              retryAfter: native.retryAfter,
+              authUsable: true,
+              windows: native.windows,
+            });
+          } else {
+            transientFailure = failure;
+          }
+          transientFailureIsEnv = true;
+          break;
+        }
         if (failure.definitiveAuth) {
           if (!definitiveFailure) {
             definitiveFailure = failure;
@@ -717,7 +774,7 @@ async function attemptClaudeQuota(
     new ClaudeFailure("Claude quota unavailable", { staleEligible: true });
   // A failed Keychain discovery/read never saw the live session. A 401 from a leftover
   // oauth-file sidecar is not evidence the user is signed out of Claude.
-  if (keychainFailure && failure.definitiveAuth) {
+  if (keychainFailure && failure.definitiveAuth && !definitiveFailureIsEnv) {
     failure = new ClaudeFailure(keychainFailure.source.error!, {
       staleEligible: true,
     });
@@ -766,7 +823,9 @@ function failureReport(
     }
   }
 
-  return failedProvider({
+  const observedWindows =
+    failure.windows && failure.windows.length > 0 ? failure.windows : undefined;
+  const report = failedProvider({
     provider: "claude",
     label: "Claude",
     status: failure.status,
@@ -774,7 +833,11 @@ function failureReport(
     retryAfter: failure.retryAfter,
     sourcesTried: sourceNames(attempts),
     attempts,
+    ...(observedWindows ? { source: "cli" } : {}),
   });
+  if (failure.authUsable) report.state.authStatus = "usable";
+  if (observedWindows) report.windows = observedWindows;
+  return report;
 }
 
 function staleClaudeReport(
@@ -1486,7 +1549,7 @@ async function fetchOauthUsage(credentials: ClaudeCredentials): Promise<{
       },
       signal: controller.signal,
     });
-    rejectUnusableUsageResponse(response);
+    await rejectUnusableUsageResponse(response, credentials.source === "env");
     const quota = normalizeClaudeApiUsage(
       await response.json(),
       credentials.plan,
@@ -1549,7 +1612,10 @@ function unverifiedClaudeIdentity(error: string): ClaudeIdentityResult {
 // Anthropic's OAuth usage endpoint uses 401 for failed authentication. A 403
 // can also be a network-policy or WAF denial, so it is not sufficient evidence
 // for a sign-out verdict. 429 follows standard Retry-After semantics (RFC 9110).
-function rejectUnusableUsageResponse(response: Response): void {
+async function rejectUnusableUsageResponse(
+  response: Response,
+  envSelected: boolean,
+): Promise<void> {
   if (response.status === 401) {
     throw new ClaudeFailure("Claude sign-in required", {
       status: "auth_required",
@@ -1563,10 +1629,107 @@ function rejectUnusableUsageResponse(response: Response): void {
       retryAfter: retryAfterToIso(response.headers.get("retry-after")),
     });
   }
+  if (
+    response.status === 403 &&
+    envSelected &&
+    (await isClaudeEnvProfileScopeDenial(response))
+  ) {
+    throw new ClaudeFailure("claude_env_usage_scope_unavailable", {
+      status: "unavailable",
+      authUsable: true,
+      envProfileScopeDenied: true,
+    });
+  }
   if (!response.ok) {
     throw new ClaudeFailure(`Claude quota unavailable (${response.status})`, {
       staleEligible: true,
     });
+  }
+}
+
+/**
+ * Read a bounded 403 envelope and recognize only the exact `user:profile`
+ * scope-denial shape established by the vendor response. Any other body -
+ * another scope, a generic envelope, non-JSON, oversized, or one that never
+ * completes - is simply not that denial. The body never leaves this function.
+ */
+export async function isClaudeEnvProfileScopeDenial(
+  response: Response,
+  options: { maxBytes?: number; deadlineMs?: number } = {},
+): Promise<boolean> {
+  const maxBytes = options.maxBytes ?? 16 * 1024;
+  const deadlineMs = options.deadlineMs ?? 1_000;
+  const contentLength = Number(response.headers.get("content-length"));
+  if (Number.isFinite(contentLength) && contentLength > maxBytes) return false;
+
+  const body = await readBoundedResponseBody(response, maxBytes, deadlineMs);
+  if (body === undefined) return false;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return false;
+  }
+  const error = objectValue(objectValue(parsed)?.error);
+  const message = stringValue(error?.message);
+  return (
+    stringValue(error?.type) === "permission_error" &&
+    message !== undefined &&
+    /^OAuth token does not meet scope requirement user:profile\.?$/i.test(
+      message.trim(),
+    )
+  );
+}
+
+/** Resolves undefined when the body is oversized or does not complete in time. */
+async function readBoundedResponseBody(
+  response: Response,
+  maxBytes: number,
+  deadlineMs: number,
+): Promise<string | undefined> {
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const read = async (): Promise<string | undefined> => {
+    const chunks: Uint8Array[] = [];
+    let bytes = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        bytes += value.byteLength;
+        if (bytes > maxBytes) {
+          await reader.cancel();
+          return undefined;
+        }
+        chunks.push(value);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    const joined = new Uint8Array(bytes);
+    let offset = 0;
+    for (const chunk of chunks) {
+      joined.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return new TextDecoder().decode(joined);
+  };
+
+  try {
+    return await Promise.race([
+      read(),
+      new Promise<undefined>((resolve) => {
+        timer = setTimeout(() => {
+          resolve(undefined);
+          void reader.cancel().catch(() => undefined);
+        }, deadlineMs);
+        timer.unref();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 
@@ -1671,6 +1834,9 @@ class ClaudeFailure extends Error {
   readonly definitiveAuth: boolean;
   readonly staleEligible: boolean;
   readonly retryAfter: string | undefined;
+  readonly authUsable: boolean;
+  readonly envProfileScopeDenied: boolean;
+  readonly windows: QuotaWindow[] | undefined;
   usageFetchFailure = false;
 
   constructor(
@@ -1683,6 +1849,9 @@ class ClaudeFailure extends Error {
     this.definitiveAuth = options.definitiveAuth ?? false;
     this.staleEligible = options.staleEligible ?? false;
     this.retryAfter = options.retryAfter;
+    this.authUsable = options.authUsable ?? false;
+    this.envProfileScopeDenied = options.envProfileScopeDenied ?? false;
+    this.windows = options.windows;
   }
 
   withUsageFetchFailure(): this {

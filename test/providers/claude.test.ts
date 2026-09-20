@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  isClaudeEnvProfileScopeDenial,
   normalizeClaudeApiUsage,
   normalizeClaudeProfile,
 } from "../../src/providers/claude.js";
@@ -132,5 +133,79 @@ describe("Claude OAuth profile parsing", () => {
         emailAddress: "person@example.invalid",
       }),
     ).toBeUndefined();
+  });
+});
+
+describe("Claude usage 403 classification", () => {
+  it.each([
+    [
+      true,
+      {
+        type: "error",
+        error: {
+          type: "permission_error",
+          message: "OAuth token does not meet scope requirement user:profile",
+          detail: "SYNTHETIC_SECRET_MUST_NOT_ESCAPE",
+        },
+      },
+    ],
+    [
+      false,
+      {
+        error: {
+          code: "oauth_scope_insufficient",
+          message: "SYNTHETIC_SECRET_MUST_NOT_ESCAPE",
+        },
+      },
+    ],
+    [
+      false,
+      {
+        error: {
+          type: "permission_error",
+          message: "OAuth token does not meet scope requirement user:inference",
+        },
+      },
+    ],
+    [
+      false,
+      {
+        error: {
+          type: "permission_error",
+          message: "A generic message mentions user:profile but proves nothing",
+        },
+      },
+    ],
+  ])(
+    "recognizes only the exact user:profile denial (%s)",
+    async (expected, body) => {
+      await expect(
+        isClaudeEnvProfileScopeDenial(Response.json(body, { status: 403 })),
+      ).resolves.toBe(expected);
+    },
+  );
+
+  it("does not recognize malformed or oversized bodies", async () => {
+    await expect(
+      isClaudeEnvProfileScopeDenial(new Response("not-json", { status: 403 })),
+    ).resolves.toBe(false);
+    await expect(
+      isClaudeEnvProfileScopeDenial(
+        new Response("x".repeat(129), { status: 403 }),
+        { maxBytes: 128 },
+      ),
+    ).resolves.toBe(false);
+  });
+
+  it("does not recognize a response body that never completes", async () => {
+    const body = new ReadableStream({
+      pull: () => new Promise(() => undefined),
+    });
+
+    await expect(
+      isClaudeEnvProfileScopeDenial(new Response(body, { status: 403 }), {
+        deadlineMs: 5,
+      }),
+    ).resolves.toBe(false);
   });
 });

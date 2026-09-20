@@ -9,7 +9,12 @@ export type ProviderId =
   | "agy"
   | "alibaba"
   | "opencode-go"
-  | "commandcode";
+  | "commandcode"
+  | "minimax"
+  | "mimo"
+  | "deepseek"
+  | "openrouter"
+  | "elevenlabs";
 
 export const PROVIDER_IDS = [
   "claude",
@@ -23,7 +28,16 @@ export const PROVIDER_IDS = [
   "alibaba",
   "opencode-go",
   "commandcode",
+  "minimax",
+  "mimo",
+  "deepseek",
+  "openrouter",
+  "elevenlabs",
 ] as const satisfies readonly ProviderId[];
+
+export const DEFAULT_PROVIDER_IDS = PROVIDER_IDS.filter(
+  (provider) => provider !== "minimax",
+);
 
 export type ProviderSource =
   | "oauth"
@@ -52,7 +66,8 @@ export type ProviderAuthStatus = "usable" | "expired_refreshable" | "unusable";
 
 export type ProviderStateReason =
   | "keychain_access_required"
-  | "credentials_expired";
+  | "credentials_expired"
+  | "inference_opt_in_required";
 
 export type QuotaPaceStatus = "ahead" | "on_pace" | "behind" | "unknown";
 
@@ -184,6 +199,12 @@ export type QuotaWindow = {
   kind: "session" | "weekly" | "monthly" | "model" | "credits" | "unknown";
   percentUsed?: number;
   percentRemaining?: number;
+  /**
+   * Parent window this used-share belongs to. Present only when the window is
+   * not an independent allowance: `percentUsed` is the share of that parent,
+   * and `percentRemaining` is omitted rather than derived.
+   */
+  shareOf?: string;
   startsAt?: string;
   resetsAt?: string;
   resetText?: string;
@@ -278,7 +299,7 @@ export type ProviderQuota = {
   credits?: {
     remaining?: number;
     unlimited?: boolean;
-    unit?: "usd" | "credits";
+    unit?: "usd" | "cny" | "credits";
   };
   state: {
     status: ProviderStatus;
@@ -316,6 +337,11 @@ export type QuotaAxiResponse = {
 
 export type ProviderOptions = {
   allowKeychainPrompt: boolean;
+  /**
+   * Explicitly permit one bounded Claude Code inference to read quota response
+   * headers when an env bearer cannot use the zero-spend usage endpoint.
+   */
+  allowClaudeInference?: boolean;
   /** Restrict discovery to the provider's selected native profile file. */
   credentialMode?: "profile-only";
   /**
@@ -356,7 +382,7 @@ export type IntelligenceBucket = "high" | "medium" | "low";
 
 /** Native-provider model knowledge used by the `models` evidence join. */
 export type ModelCatalogEntry = {
-  provider: "claude" | "codex" | "grok" | "kimi";
+  provider: ProviderId;
   id: string;
   label: string;
   intelligence: IntelligenceBucket;

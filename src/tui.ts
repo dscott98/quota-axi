@@ -76,6 +76,11 @@ const ACCENTS: Record<ProviderId, StyleSpec> = {
   alibaba: { rgb: [255, 155, 120], ansi16: "91", bold: true },
   "opencode-go": { rgb: [160, 210, 255], ansi16: "96", bold: true },
   commandcode: { rgb: [110, 210, 168], ansi16: "92", bold: true },
+  minimax: { rgb: [255, 196, 112], ansi16: "93", bold: true },
+  mimo: { rgb: [174, 214, 241], ansi16: "96", bold: true },
+  deepseek: { rgb: [88, 160, 242], ansi16: "94", bold: true },
+  openrouter: { rgb: [183, 148, 232], ansi16: "95", bold: true },
+  elevenlabs: { rgb: [214, 170, 255], ansi16: "95", bold: true },
 };
 
 const STYLES: Record<Exclude<StyleName, `accent:${ProviderId}`>, StyleSpec> = {
@@ -235,7 +240,9 @@ function buildLiveCard(provider: ProviderQuota, generatedAtMs: number): Card {
   if (provider.windows.length > 0) {
     lines.push(interior([], "border"));
     for (const window of provider.windows) {
-      lines.push(interior(windowRow(window, generatedAtMs), "border"));
+      lines.push(
+        interior(windowRow(window, generatedAtMs, provider.windows), "border"),
+      );
     }
   }
 
@@ -484,7 +491,14 @@ function interior(content: Line, borderStyle: StyleName): Line {
   ];
 }
 
-function windowRow(window: QuotaWindow, generatedAtMs: number): Line {
+function windowRow(
+  window: QuotaWindow,
+  generatedAtMs: number,
+  windows: QuotaWindow[],
+): Line {
+  if (window.shareOf) {
+    return shareWindowRow(window, generatedAtMs, windows);
+  }
   const pct = window.percentRemaining;
   const marker = window.pace?.timeRemainingPercent;
   const reset = resetCountdown(window, generatedAtMs);
@@ -501,6 +515,42 @@ function windowRow(window: QuotaWindow, generatedAtMs: number): Line {
     { text: padEndDisplay(reset, 6), style: "dim" },
     { text: " " },
   ];
+}
+
+/**
+ * A used-share has no own remaining, so the remaining bar and `?` would make
+ * it look unmeasured. Print the used percent of the parent instead.
+ */
+function shareWindowRow(
+  window: QuotaWindow,
+  generatedAtMs: number,
+  windows: QuotaWindow[],
+): Line {
+  const reset = resetCountdown(window, generatedAtMs);
+  const captionWidth = WINDOW_BAR_WIDTH + 1 + 4;
+  return [
+    { text: "   " },
+    { text: padEndDisplay(shortWindowLabel(window), 8), style: "label" },
+    {
+      text: padEndDisplay(
+        truncate(shareCaption(window, windows), captionWidth),
+        captionWidth,
+      ),
+      style: "label",
+    },
+    { text: "  " },
+    { text: padEndDisplay(reset, 6), style: "dim" },
+    { text: " " },
+  ];
+}
+
+function shareCaption(window: QuotaWindow, windows: QuotaWindow[]): string {
+  const parent = windows.find((candidate) => candidate.id === window.shareOf);
+  const parentLabel = parent
+    ? shortWindowLabel(parent)
+    : truncate(window.shareOf ?? "", 7);
+  if (window.percentUsed === undefined) return `share of ${parentLabel}`;
+  return `${Math.round(window.percentUsed)}% of ${parentLabel}`;
 }
 
 /**

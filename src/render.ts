@@ -146,6 +146,7 @@ function quotaBlocks(response: QuotaAxiResponse): ProviderBlocks {
     blocks.attention.push(
       ...providerAttention(provider, measured, scopeAttention.length),
     );
+    blocks.attention.push(...shareRows(provider));
     blocks.attention.push(...scopeAttention);
   }
   return blocks;
@@ -207,6 +208,25 @@ function providerAttention(
   ];
 }
 
+function shareRows(provider: ProviderQuota): AttentionRow[] {
+  return provider.windows
+    .filter((window) => window.shareOf)
+    .map((window) => ({
+      ...providerColumns(provider),
+      scope: "all",
+      kind: "share",
+      detail: shareDetail(window),
+      remedy: NONE,
+    }));
+}
+
+function shareDetail(window: QuotaWindow): string {
+  const relationship = `${window.id} of ${window.shareOf}`;
+  return window.percentUsed === undefined
+    ? relationship
+    : `${relationship}${DETAIL_SEPARATOR}${window.percentUsed}`;
+}
+
 /**
  * A working sibling answered for this provider, so the rows above are healthy
  * and this is the only place the superseded breakage is still stated.
@@ -262,7 +282,7 @@ function providerStateRows(
   const credits = creditBalance(provider);
   if (credits) {
     rows.unshift({
-      provider: provider.provider,
+      ...providerColumns(provider),
       scope: "all",
       kind: "credits",
       detail: `${credits}${suffix}`,
@@ -602,7 +622,7 @@ export function quotaJsonReport(
 function demotedWindow(window: QuotaWindow): QuotaWindow {
   return {
     ...window,
-    percentUsed: undefined,
+    percentUsed: window.shareOf === undefined ? undefined : window.percentUsed,
     startsAt: undefined,
     windowSeconds: undefined,
     ...(window.pace

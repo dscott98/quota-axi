@@ -163,7 +163,49 @@ function semanticsFor(
         provider.state.untrustedWindowIds ?? [],
         generatedAt,
       );
+    case "minimax":
+      return unknownSemantics(
+        provider.windows,
+        "MiniMax publishes per-model Coding Plan meters but does not establish whether those meters are independent or jointly bound, so effective remaining percentage stays unknown.",
+      );
+    case "mimo":
+      return unknownSemantics(
+        provider.windows,
+        "MiMo exposes local API authentication, but no first-party read-only quota endpoint is established, so model headroom remains unknown.",
+      );
+    case "deepseek":
+    case "openrouter":
+      return unknownSemantics(
+        provider.windows,
+        `${provider.label ?? provider.provider} reports a credit balance, not a usage window. quota-axi exposes the raw balance but does not infer an effective remaining percentage.`,
+      );
+    case "elevenlabs":
+      return elevenLabsSemantics(provider.windows, generatedAt);
   }
+}
+
+/**
+ * ElevenLabs meters one thing: the characters the subscription plan includes
+ * for the current refresh period. It is scoped `included_characters` rather
+ * than `all_models` for the same reason Command Code's windows are scoped
+ * `included_credits` - the vendor's `can_extend_character_limit` plans bill
+ * usage past the included allowance, so a zeroed window says that allowance is
+ * spent, not that requests stop. It is a speech allowance rather than a
+ * coding-agent lane, so it never binds a model scope either.
+ */
+function elevenLabsSemantics(
+  windows: QuotaWindow[],
+  generatedAt: string,
+): QuotaSemantics {
+  const characters = windows.filter(({ id }) => id === "characters");
+  const description =
+    "ElevenLabs' characters window is the subscription plan's included character allowance for the current refresh period, so it bounds the included_characters scope only. Plans that can extend the character limit bill usage past it, so a zeroed window means the included allowance is spent, not that requests are refused.";
+  return knownSemantics(
+    characters.length > 0
+      ? [availability("included_characters", characters, generatedAt)]
+      : [],
+    description,
+  );
 }
 
 /**
@@ -434,13 +476,6 @@ function grokSemantics(
 
 const KIMI_ACCOUNT_WINDOW_IDS = new Set(["weekly", "five_hour", "month_total"]);
 
-/**
- * `month_code` is the code-typed share of `month_total` as the vendor serves
- * it, not a cap of its own, so it is recognized - never unresolved - but it
- * bounds nothing and no remaining is derived from it.
- */
-const KIMI_SHARE_WINDOW_IDS = new Set(["month_code"]);
-
 const KIMI_CODE_SHARE_NOTE =
   "The monthly code window is the code-typed share of that monthly total rather than a separate allowance, so it adds no bound.";
 
@@ -450,9 +485,11 @@ function kimiSemantics(
   generatedAt: string,
 ): QuotaSemantics {
   const bounds = windows.filter(({ id }) => KIMI_ACCOUNT_WINDOW_IDS.has(id));
+  // A window marked `shareOf` is a used-share of a parent window, not a cap
+  // of its own, so it is recognized - never unresolved - but bounds nothing.
   const unresolved = windows.filter(
-    ({ id }) =>
-      !KIMI_ACCOUNT_WINDOW_IDS.has(id) && !KIMI_SHARE_WINDOW_IDS.has(id),
+    ({ id, shareOf }) =>
+      !KIMI_ACCOUNT_WINDOW_IDS.has(id) && shareOf === undefined,
   );
   const unresolvedWindowIds = [
     ...new Set([...unresolved.map(({ id }) => id), ...untrustedWindowIds]),

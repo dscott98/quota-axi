@@ -5,11 +5,17 @@ import { commandCodeAdapter } from "./commandcode.js";
 import { codexAdapter } from "./codex.js";
 import { copilotAdapter } from "./copilot.js";
 import { cursorAdapter } from "./cursor.js";
+import { elevenLabsAdapter } from "./elevenlabs.js";
 import { grokAdapter } from "./grok.js";
 import { kimiAdapter } from "./kimi.js";
 import { opencodeGoAdapter } from "./opencode-go.js";
+import { minimaxAdapter } from "./minimax.js";
+import { mimoAdapter } from "./mimo.js";
+import { deepseekAdapter } from "./deepseek.js";
+import { openrouterAdapter } from "./openrouter.js";
 import { zaiAdapter } from "./zai.js";
 import {
+  DEFAULT_PROVIDER_IDS,
   PROVIDER_IDS,
   type ProviderAdapter,
   type ProviderId,
@@ -27,10 +33,15 @@ export const PROVIDERS: Record<ProviderId, ProviderAdapter> = {
   alibaba: alibabaAdapter,
   "opencode-go": opencodeGoAdapter,
   commandcode: commandCodeAdapter,
+  minimax: minimaxAdapter,
+  mimo: mimoAdapter,
+  deepseek: deepseekAdapter,
+  openrouter: openrouterAdapter,
+  elevenlabs: elevenLabsAdapter,
 };
 
 export function parseProviders(value: string | undefined): ProviderId[] {
-  if (!value) return [...PROVIDER_IDS];
+  if (!value) return [...DEFAULT_PROVIDER_IDS];
   const providers = value
     .split(",")
     .map((item) => item.trim())

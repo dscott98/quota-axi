@@ -25,6 +25,7 @@ import {
   publishCommandCodeReadingContextId,
 } from "../src/providers/commandcode-cache-context.js";
 import { staleFromCache } from "../src/providers/common.js";
+import { withQuotaSemantics } from "../src/interpretation.js";
 import { createKimiCodeCliCredentialSource } from "../src/providers/kimi-code-cli-credential.js";
 import type { ProviderId, ProviderQuota } from "../src/types.js";
 
@@ -47,6 +48,24 @@ afterEach(() => {
 });
 
 describe("quota cache", () => {
+  it.each([true, false])(
+    "leaves persistent snapshots untouched by native Claude reads with windows %s",
+    (hasWindows) => {
+      useTempCache();
+      writeCachedProviders([quota("claude", 20), quota("copilot", 30)]);
+      const before = readFileSync(cacheFilePath(), "utf8");
+      const native = quota("claude", 80);
+      native.source = "cli";
+      native.state.sourcesTried = ["env", "claude-native-inference"];
+      if (!hasWindows) native.windows = [];
+      writeCachedProviders([native]);
+      expect(readFileSync(cacheFilePath(), "utf8")).toBe(before);
+      writeCachedProviders([native, quota("copilot", 40)]);
+      expect(readCachedProvider("claude")?.windows[0]?.percentUsed).toBe(20);
+      expect(readCachedProvider("copilot")?.windows[0]?.percentUsed).toBe(40);
+    },
+  );
+
   it("ignores malformed matching entries", () => {
     useTempCache();
     const file = cacheFilePath();
@@ -436,6 +455,90 @@ oauth_host = "https://auth.kimi.ai"
     expect(cachedWindow?.pace).toBeUndefined();
   });
 
+  it("retains a used-share parent marker without inventing remaining", () => {
+    useTempCache();
+    const provider = quota("copilot", 40);
+    provider.windows.push({
+      id: "month_code",
+      label: "code month",
+      kind: "monthly",
+      percentUsed: 25,
+      shareOf: "month_total",
+    });
+
+    writeCachedProviders([provider]);
+
+    const cached = readCachedProvider("copilot")?.windows[1];
+    expect(cached).toMatchObject({
+      id: "month_code",
+      percentUsed: 25,
+      shareOf: "month_total",
+    });
+    expect(cached?.percentRemaining).toBeUndefined();
+  });
+
+  it("presents a 0.1.47 Kimi month_code snapshot as a share of month_total", () => {
+    useTempCache();
+    const file = cacheFilePath();
+    const contextId = "b".repeat(64);
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(
+      file,
+      JSON.stringify({
+        generatedAt: "2026-07-06T18:10:00Z",
+        schemaVersion: 3,
+        providers: [
+          {
+            provider: "kimi",
+            credentialContext: contextId,
+            label: "Kimi",
+            source: "api",
+            windows: [
+              {
+                id: "month_total",
+                label: "month",
+                kind: "monthly",
+                percentUsed: 40,
+                percentRemaining: 60,
+              },
+              {
+                id: "month_code",
+                label: "code month",
+                kind: "monthly",
+                percentUsed: 25,
+              },
+            ],
+            state: {
+              status: "fresh",
+              stale: false,
+              refreshedAt: "2026-07-06T18:10:00Z",
+              sourcesTried: ["kimi-code"],
+            },
+          },
+        ],
+      }),
+    );
+
+    const stale = staleFromCache(
+      readCachedKimiProvider(contextId)!,
+      "fetch failed: synthetic outage",
+      ["kimi-code"],
+      [],
+    );
+    const monthCode = stale.windows.find(
+      (window) => window.id === "month_code",
+    );
+    expect(monthCode).toMatchObject({
+      percentUsed: 25,
+      shareOf: "month_total",
+    });
+    expect(monthCode?.percentRemaining).toBeUndefined();
+    expect(
+      withQuotaSemantics(stale, "2026-07-06T18:20:00Z").quotaSemantics
+        ?.unresolvedWindowIds,
+    ).toBeUndefined();
+  });
+
   it("deletes a definitive-auth provider while retaining other snapshots", () => {
     useTempCache();
     writeCachedProviders([quota("claude", 10), quota("kimi", 20)]);
@@ -596,5 +699,6 @@ function providerLabel(provider: ProviderId): string {
   if (provider === "agy") return "Antigravity";
   if (provider === "commandcode") return "Command Code";
   if (provider === "opencode-go") return "OpenCode Go";
+  if (provider === "minimax") return "MiniMax";
   return "Kimi";
 }
