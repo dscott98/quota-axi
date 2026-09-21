@@ -6,6 +6,7 @@ import {
   renderTuiHintLine,
   shortWindowLabel,
   thinBar,
+  windowLabelColumnWidth,
 } from "../src/tui.js";
 import { withQuotaSemantics } from "../src/interpretation.js";
 import type { ProviderQuota } from "../src/types.js";
@@ -185,7 +186,8 @@ describe("renderQuotaTui structure", () => {
       // marker from their mapped window's reset clock (19.7%), not the other
       // window's runway projection.
       expect(headlineBar).toContain(barText(thinBar(84, 19.7, 41)));
-      expect(mappedRow).toContain(barText(thinBar(84, 19.7, 22)));
+      // 22-cell bar minus the label column's one-cell gutter.
+      expect(mappedRow).toContain(barText(thinBar(84, 19.7, 21)));
     }
   });
 
@@ -832,6 +834,91 @@ describe("cards for providers with no combinable bound", () => {
       ).toBe(true);
     },
   );
+});
+
+describe("per-model window rows without a combined bound", () => {
+  const minimax = withQuotaSemantics(
+    {
+      provider: "minimax",
+      label: "MiniMax",
+      source: "api",
+      windows: [
+        {
+          id: "model:general:interval",
+          label: "general interval",
+          kind: "session",
+          percentUsed: 0,
+          percentRemaining: 100,
+          resetsAt: "2026-08-07T00:00:00.000Z",
+        },
+        {
+          id: "model:general:weekly",
+          label: "general weekly",
+          kind: "weekly",
+          percentUsed: 7,
+          percentRemaining: 93,
+          resetsAt: "2026-08-07T00:00:00.000Z",
+        },
+        {
+          id: "model:video:interval",
+          label: "video interval",
+          kind: "session",
+          percentUsed: 0,
+          percentRemaining: 100,
+          resetsAt: "2026-08-07T00:00:00.000Z",
+        },
+        {
+          id: "model:video:weekly",
+          label: "video weekly",
+          kind: "weekly",
+          percentUsed: 0,
+          percentRemaining: 100,
+          resetsAt: "2026-08-07T00:00:00.000Z",
+        },
+      ],
+      state: { status: "fresh", stale: false, sourcesTried: ["api"] },
+    },
+    GENERATED_AT,
+  );
+  const lines = renderQuotaTui(
+    { generatedAt: GENERATED_AT, schemaVersion: 5, providers: [minimax] },
+    { timeZone: "America/Los_Angeles" },
+  ).split("\n");
+
+  it("spells all four vendor meters out instead of truncating them to identical ellipses", () => {
+    for (const label of [
+      "general interval",
+      "general weekly",
+      "video interval",
+      "video weekly",
+    ]) {
+      const line = findLine(lines, `│   ${label}`);
+      expect(line, `${label} keeps a gutter before its bar`).toContain(
+        `${label} `,
+      );
+      expect(
+        stripAnsi(line),
+        `${label} row stays inside the card`,
+      ).toHaveLength(CARD_COLUMNS);
+      expect(line).toMatch(/[━─]/);
+    }
+    expect(findLine(lines, "general weekly")).toContain(" 93%");
+    expect(findLine(lines, "general interval")).toContain("100%");
+    // A fixed 8-cell column rendered all four rows as "genera…" or "video …".
+    expect(lines.join("\n")).not.toContain("genera…");
+  });
+
+  it("derives the label column from the card's own labels", () => {
+    expect(windowLabelColumnWidth(minimax.windows)).toBe(16);
+    expect(
+      windowLabelColumnWidth([
+        { id: "five_hour", label: "session", kind: "session" },
+        { id: "seven_day", label: "week", kind: "weekly" },
+      ]),
+    ).toBe(8);
+    expect(shortWindowLabel(minimax.windows[0]!)).toBe("general interval");
+    expect(shortWindowLabel(minimax.windows[0]!, 8)).toBe("general…");
+  });
 });
 
 describe("used-share window rows", () => {

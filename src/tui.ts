@@ -30,8 +30,18 @@ const CARD_INTERIOR = CARD_WIDTH - 2;
 const CARD_GUTTER = 2;
 const TWO_COLUMN_MIN = CARD_WIDTH * 2 + CARD_GUTTER;
 const EFFECTIVE_BAR_WIDTH = 41;
-/** 3 gutter + 8 label + bar + 1 + 4 percent + 2 + 6 reset + 1 = CARD_INTERIOR. */
+/** 3 gutter + label + bar + 1 + 4 percent + 2 + 6 reset + 1 = CARD_INTERIOR. */
 const WINDOW_BAR_WIDTH = CARD_INTERIOR - 25;
+/**
+ * The window-row label column widens per card from 8 up to 16 display cells.
+ * A fixed 8 collapses distinct vendor windows into identical ellipses
+ * (MiniMax's "general interval" and "general weekly" both became
+ * "genera…", so the four meters were unreadable); 16 fits those whole
+ * labels and Alibaba model slugs ("qwen3-coder-plus") while still leaving a
+ * 14-cell bar, and cards whose labels are already short keep today's layout.
+ */
+const WINDOW_LABEL_MIN_WIDTH = 8;
+const WINDOW_LABEL_MAX_WIDTH = 16;
 const MIN_COLUMNS = 80;
 const MAX_COLUMNS = 120;
 const GRAPHEME_SEGMENTER = new Intl.Segmenter("en", {
@@ -238,10 +248,14 @@ function buildLiveCard(provider: ProviderQuota, generatedAtMs: number): Card {
   }
 
   if (provider.windows.length > 0) {
+    const labelWidth = windowLabelColumnWidth(provider.windows);
     lines.push(interior([], "border"));
     for (const window of provider.windows) {
       lines.push(
-        interior(windowRow(window, generatedAtMs, provider.windows), "border"),
+        interior(
+          windowRow(window, generatedAtMs, provider.windows, labelWidth),
+          "border",
+        ),
       );
     }
   }
@@ -495,17 +509,24 @@ function windowRow(
   window: QuotaWindow,
   generatedAtMs: number,
   windows: QuotaWindow[],
+  labelWidth: number,
 ): Line {
   if (window.shareOf) {
-    return shareWindowRow(window, generatedAtMs, windows);
+    return shareWindowRow(window, generatedAtMs, windows, labelWidth);
   }
   const pct = window.percentRemaining;
   const marker = window.pace?.timeRemainingPercent;
   const reset = resetCountdown(window, generatedAtMs);
   return [
     { text: "   " },
-    { text: padEndDisplay(shortWindowLabel(window), 8), style: "label" },
-    ...thinBar(pct, marker, WINDOW_BAR_WIDTH),
+    {
+      text: padEndDisplay(
+        shortWindowLabel(window, labelWidth),
+        windowLabelFieldWidth(labelWidth),
+      ),
+      style: "label",
+    },
+    ...thinBar(pct, marker, windowBarWidth(labelWidth)),
     { text: " " },
     {
       text: (pct === undefined ? "?" : `${Math.round(pct)}%`).padStart(4),
@@ -517,6 +538,38 @@ function windowRow(
   ];
 }
 
+/** The bar gives back exactly the cells the label column borrowed. */
+function windowBarWidth(labelWidth: number): number {
+  return (
+    WINDOW_BAR_WIDTH -
+    (windowLabelFieldWidth(labelWidth) - WINDOW_LABEL_MIN_WIDTH)
+  );
+}
+
+/**
+ * The label field keeps one trailing gutter cell, as it always did when the
+ * column was fixed at 8, so a label that exactly fills the column ("general
+ * interval") never touches the bar.
+ */
+function windowLabelFieldWidth(labelWidth: number): number {
+  return labelWidth + 1;
+}
+
+/**
+ * The widest compacted label on the card, clamped to the column range, so a
+ * card only widens its label column as far as its own labels need.
+ */
+export function windowLabelColumnWidth(windows: QuotaWindow[]): number {
+  let width = WINDOW_LABEL_MIN_WIDTH;
+  for (const window of windows) {
+    width = Math.max(
+      width,
+      displayWidth(shortWindowLabel(window, WINDOW_LABEL_MAX_WIDTH)),
+    );
+  }
+  return Math.min(width, WINDOW_LABEL_MAX_WIDTH);
+}
+
 /**
  * A used-share has no own remaining, so the remaining bar and `?` would make
  * it look unmeasured. Print the used percent of the parent instead.
@@ -525,15 +578,22 @@ function shareWindowRow(
   window: QuotaWindow,
   generatedAtMs: number,
   windows: QuotaWindow[],
+  labelWidth: number,
 ): Line {
   const reset = resetCountdown(window, generatedAtMs);
-  const captionWidth = WINDOW_BAR_WIDTH + 1 + 4;
+  const captionWidth = windowBarWidth(labelWidth) + 1 + 4;
   return [
     { text: "   " },
-    { text: padEndDisplay(shortWindowLabel(window), 8), style: "label" },
     {
       text: padEndDisplay(
-        truncate(shareCaption(window, windows), captionWidth),
+        shortWindowLabel(window, labelWidth),
+        windowLabelFieldWidth(labelWidth),
+      ),
+      style: "label",
+    },
+    {
+      text: padEndDisplay(
+        truncate(shareCaption(window, windows, labelWidth), captionWidth),
         captionWidth,
       ),
       style: "label",
@@ -544,11 +604,15 @@ function shareWindowRow(
   ];
 }
 
-function shareCaption(window: QuotaWindow, windows: QuotaWindow[]): string {
+function shareCaption(
+  window: QuotaWindow,
+  windows: QuotaWindow[],
+  labelWidth: number,
+): string {
   const parent = windows.find((candidate) => candidate.id === window.shareOf);
   const parentLabel = parent
-    ? shortWindowLabel(parent)
-    : truncate(window.shareOf ?? "", 7);
+    ? shortWindowLabel(parent, labelWidth)
+    : truncate(window.shareOf ?? "", labelWidth);
   if (window.percentUsed === undefined) return `share of ${parentLabel}`;
   return `${Math.round(window.percentUsed)}% of ${parentLabel}`;
 }
@@ -717,11 +781,15 @@ function compactHeadlineWindowName(label: string, width: number): string {
 }
 
 /**
- * Compress a window label into the 7-char row column: drop a trailing
- * period/unit token ("Fable week" -> "fable", "730h window" -> "730h"),
- * then fall back to the last hyphen segment and an ellipsis.
+ * Compress a window label into the row-label column: drop a trailing
+ * period/unit token ("Fable week" -> "fable", "730h window" -> "730h"), then
+ * fall back to the last hyphen segment and an ellipsis when it still does
+ * not fit.
  */
-export function shortWindowLabel(window: QuotaWindow): string {
+export function shortWindowLabel(
+  window: QuotaWindow,
+  width = WINDOW_LABEL_MAX_WIDTH,
+): string {
   const tokens = window.label.split(/[\s_]+/).filter(Boolean);
   if (
     tokens.length > 1 &&
@@ -732,11 +800,12 @@ export function shortWindowLabel(window: QuotaWindow): string {
     tokens.pop();
   }
   let label = tokens.join(" ").toLowerCase();
-  if (displayWidth(label) > 7 && label.includes("-")) {
-    label = label.slice(label.lastIndexOf("-") + 1);
+  if (displayWidth(label) > width && label.includes("-")) {
+    const tail = label.slice(label.lastIndexOf("-") + 1);
+    if (displayWidth(tail) <= width) label = tail;
   }
-  if (displayWidth(label) > 7) label = truncate(label, 7);
-  return label || truncate(window.id, 7);
+  if (displayWidth(label) > width) label = truncate(label, width);
+  return label || truncate(window.id, width);
 }
 
 function resetCountdown(window: QuotaWindow, generatedAtMs: number): string {

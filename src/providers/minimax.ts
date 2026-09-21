@@ -1,640 +1,860 @@
-/**
- * MiniMax (minimax) provider adapter.
- *
- * MiniMax's Coding Plan remains endpoint reports the vendor's current
- * time- or count-metered allowance. The adapter publishes only its supplied
- * percentages and counter-derived values; it never calls inference.
- *
- * It honours the smallest opt-in surface agreed in the package:
- *  - `$MINIMAX_API_KEY` first (explicit caller intent).
- *  - opencode `auth.json` `minimax` or `minimax-coding-plan`.
- *  - Pi's `$PI_CODING_AGENT_DIR/auth.json` under `minimax`.
- *
- * Nothing else is read or written. The adapter never refreshes credentials,
- * never calls inference, and never derives a quota percentage from model
- * presence.
- */
-
-import { providerFetch, readBoundedResponseBody } from "../lib/http.js";
-import { selectCredential } from "./credential-selection.js";
+import { createHash } from "node:crypto";
+import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import {
+  deleteCachedProvider as deleteCachedProviderFromDisk,
+  readCachedMiniMaxProvider as readCachedProviderFromDisk,
+} from "../cache.js";
+import type { JsonFileReadResult } from "../lib/fs.js";
+import { providerFetch, readBoundedResponseBody } from "../lib/http.js";
+import { resolvePiAuthFilePath } from "../lib/pi-agent-dir.js";
 import { classifyPiAuthEntry } from "../lib/pi-auth-store.js";
 import { usableLiteralSecret } from "../lib/secret.js";
-import { readJsonFileResult, type JsonFileReadResult } from "../lib/fs.js";
-import { resolvePiAuthFilePath } from "../lib/pi-agent-dir.js";
-import { parseEpochOrIso } from "../lib/time.js";
-import { withUsageFetchFailure } from "./usage-fetch-failure.js";
-import { failedProvider, sourceNames, successProvider } from "./common.js";
+import { clampPercent, retryAfterToIso } from "../lib/time.js";
+import { publishMiniMaxReadingContextId } from "./minimax-cache-context.js";
 import type {
   AuthProviderReport,
   AuthSourceReport,
   ProviderAdapter,
-  ProviderOptions,
   ProviderQuota,
+  ProviderStatus,
   QuotaWindow,
   SourceAttempt,
 } from "../types.js";
+import {
+  failedProvider,
+  sourceNames,
+  staleFromCache,
+  successProvider,
+} from "./common.js";
+
+export const MINIMAX_QUOTA_PATH = "/v1/token_plan/remains";
+export const MINIMAX_BALANCE_PATH = "/account/query_balance";
+export const MINIMAX_GLOBAL_BASE_URL = "https://api.minimax.io";
+export const MINIMAX_CHINA_BASE_URL = "https://api.minimaxi.com";
+export const MINIMAX_PI_SOURCE = "pi:minimax";
+export const MINIMAX_CLI_SOURCE = "minimax:config.json";
+export const MINIMAX_ENV_SOURCE = "env:MINIMAX_API_KEY";
 
 const LABEL = "MiniMax";
-const OPERATION_DEADLINE_MS = 15_000;
-const MINIMAX_HOST = "api.minimax.io";
-const MINIMAX_PROBE_PATH = "/v1/api/openplatform/coding_plan/remains";
+const CONFIG_FILE_LIMIT_BYTES = 64 * 1024;
+const DEADLINE_MS = 15_000;
 
-const OPENCODE_MINIMAX_IDS = ["minimax", "minimax-coding-plan"];
-const ENV_MINIMAX_API_KEY = "MINIMAX_API_KEY";
-const OPENCODE_AUTH_SOURCE = "opencode:auth.json";
-const PI_MINIMAX_SOURCE = "pi:minimax";
+export type MiniMaxCredentialResolution =
+  | {
+      status: "available";
+      key: string;
+      source: string;
+      path?: string;
+      baseUrl: string;
+    }
+  | {
+      status: "missing" | "invalid" | "error";
+      source: string;
+      path?: string;
+      error?: string;
+    };
 
-export type MinimaxCredentialResolution =
-  | { status: "available"; apiKeys: string[]; path: string }
-  | { status: "missing"; path: string }
-  | { status: "invalid"; path: string; error: string }
-  | { status: "error"; path: string; error: string };
-
-export type MinimaxCredentialInspection =
-  | { status: "available"; path: string }
-  | { status: "missing"; path: string }
-  | { status: "invalid"; path: string; error: string }
-  | { status: "error"; path: string; error: string };
-
-export function opencodeAuthFilePath(): string {
-  const xdg = stringValue(process.env.XDG_DATA_HOME);
-  if (xdg) return join(xdg, "opencode", "auth.json");
-  if (process.platform === "win32") {
-    const localAppData = stringValue(process.env.LOCALAPPDATA);
-    if (localAppData) return join(localAppData, "opencode", "auth.json");
-  }
-  return join(join(homedir(), ".local", "share"), "opencode", "auth.json");
-}
-
-export function extractMinimaxCredential(
-  value: unknown,
-  path: string,
-): MinimaxCredentialResolution {
-  const data = objectValue(value);
-  if (!data) return { status: "invalid", path, error: "json_parse_error" };
-  let presentEntry = false;
-  const apiKeys: string[] = [];
-  for (const providerId of OPENCODE_MINIMAX_IDS) {
-    const entry = data[providerId];
-    if (entry === undefined || entry === null) continue;
-    presentEntry = true;
-    const key = extractCredentialKey(entry);
-    if (key) apiKeys.push(key);
-  }
-  if (apiKeys.length > 0) return { status: "available", apiKeys, path };
-  if (presentEntry)
-    return { status: "invalid", path, error: "invalid_credential" };
-  return { status: "missing", path };
-}
-
-function extractPiMinimaxCredential(
-  value: unknown,
-  path: string,
-): MinimaxCredentialResolution {
-  const classified = classifyPiAuthEntry(value, "minimax");
-  if (classified.status === "missing") return { status: "missing", path };
-  if (classified.status === "invalid") {
-    return { status: "invalid", path, error: "pi_entry_invalid" };
-  }
-  const entry = classified.entry;
-  if (entryType(entry) !== "api_key") {
-    return { status: "invalid", path, error: "unsupported_entry_type" };
-  }
-  const key = usableLiteralSecret(entry.key);
-  return key
-    ? { status: "available", apiKeys: [key], path }
-    : { status: "invalid", path, error: "invalid_credential" };
-}
-
-function entryType(entry: Record<string, unknown>): string | undefined {
-  const raw = entry.type;
-  return typeof raw === "string" && raw.trim()
-    ? raw.trim().toLowerCase()
-    : undefined;
-}
-
-function extractCredentialKey(entry: unknown): string | undefined {
-  const record = objectValue(entry);
-  if (record?.type !== "api") return undefined;
-  return usableLiteralSecret(record.key);
-}
-
-export type MinimaxCredentialSource = {
-  name: string;
-  path: () => string;
-  extract: (value: unknown, path: string) => MinimaxCredentialResolution;
-};
-
-function resolveMinimaxCredentialSource(
-  source: MinimaxCredentialSource,
-): MinimaxCredentialResolution {
-  const path = source.path();
-  const result: JsonFileReadResult = readJsonFileResult(path);
-  if (result.status === "missing") return { status: "missing", path };
-  if (result.status === "invalid") {
-    return result.error === "file_read_error"
-      ? { status: "error", path, error: result.error }
-      : { status: "invalid", path, error: result.error };
-  }
-  return source.extract(result.value, path);
-}
-
-function inspectMinimaxCredentialSource(
-  source: MinimaxCredentialSource,
-): MinimaxCredentialInspection {
-  const resolution = resolveMinimaxCredentialSource(source);
-  if (resolution.status === "available")
-    return { status: "available", path: resolution.path };
-  if (resolution.status === "missing")
-    return { status: "missing", path: resolution.path };
-  return resolution;
-}
-
-export function defaultMinimaxCredentialSources(): MinimaxCredentialSource[] {
-  return [
-    {
-      name: OPENCODE_AUTH_SOURCE,
-      path: opencodeAuthFilePath,
-      extract: extractMinimaxCredential,
-    },
-    {
-      name: PI_MINIMAX_SOURCE,
-      path: resolvePiAuthFilePath,
-      extract: extractPiMinimaxCredential,
-    },
-  ];
-}
-
-type MinimaxDependencies = {
-  credentialSources: MinimaxCredentialSource[];
-  envApiKey: () => string | undefined;
+type MiniMaxDependencies = {
+  credential: () => MiniMaxCredentialResolution | MiniMaxCredentialResolution[];
   fetch: typeof globalThis.fetch;
+  readCachedProvider: typeof readCachedProviderFromDisk;
+  deleteCachedProvider: typeof deleteCachedProviderFromDisk;
   now: () => number;
   deadlineMs: number;
 };
 
-export type NormalizedMinimaxProbe = {
-  windows: QuotaWindow[];
-  untrustedWindowIds: string[];
+type MiniMaxFailureOptions = {
+  status?: ProviderStatus;
+  staleEligible?: boolean;
+  definitiveAuth?: boolean;
+  retryAfter?: string;
 };
 
-export function createMinimaxAdapter(
-  overrides: Partial<MinimaxDependencies> = {},
+export type NormalizedMiniMaxPayload = {
+  plan?: string;
+  windows: QuotaWindow[];
+  credits?: ProviderQuota["credits"];
+  untrustedWindowIds?: string[];
+};
+
+export function minimaxConfigPath(): string {
+  const configured = process.env.MMX_CONFIG_DIR?.trim();
+  return join(configured || join(homedir(), ".mmx"), "config.json");
+}
+
+export function extractMiniMaxCredential(
+  value: unknown,
+  path: string,
+  source = MINIMAX_PI_SOURCE,
+): MiniMaxCredentialResolution {
+  const root = objectValue(value);
+  if (!root)
+    return { status: "invalid", source, path, error: "json_parse_error" };
+  const classified = classifyPiAuthEntry(root, "minimax");
+  if (classified.status === "missing")
+    return { status: "missing", source, path };
+  if (classified.status === "invalid")
+    return { status: "invalid", source, path, error: "credential_missing" };
+  const key = extractKey(classified.entry);
+  if (!key)
+    return { status: "invalid", source, path, error: "credential_missing" };
+  return {
+    status: "available",
+    key,
+    source,
+    path,
+    baseUrl: configuredBaseUrl(),
+  };
+}
+
+export function extractMiniMaxCliCredentials(
+  value: unknown,
+  path: string,
+): MiniMaxCredentialResolution[] {
+  const root = objectValue(value);
+  if (!root)
+    return [
+      {
+        status: "invalid",
+        source: MINIMAX_CLI_SOURCE,
+        path,
+        error: "json_parse_error",
+      },
+    ];
+  const apiKey = usableLiteralSecret(root.api_key);
+  const oauth = objectValue(root.oauth);
+  const accessToken = usableLiteralSecret(oauth?.access_token);
+  const baseUrl = configBaseUrl(root);
+  const credentials: MiniMaxCredentialResolution[] = [];
+  if (accessToken) {
+    credentials.push({
+      status: "available",
+      key: accessToken,
+      source: MINIMAX_CLI_SOURCE,
+      path,
+      baseUrl,
+    });
+  }
+  if (apiKey) {
+    credentials.push({
+      status: "available",
+      key: apiKey,
+      source: MINIMAX_CLI_SOURCE,
+      path,
+      baseUrl,
+    });
+  }
+  if (credentials.length > 0) return credentials;
+  const hasCredential = Object.hasOwn(root, "api_key") || oauth !== undefined;
+  return [
+    hasCredential
+      ? {
+          status: "invalid",
+          source: MINIMAX_CLI_SOURCE,
+          path,
+          error: "credential_missing",
+        }
+      : missingCliCredential(path),
+  ];
+}
+
+function missingCliCredential(path: string): MiniMaxCredentialResolution {
+  return { status: "missing", source: MINIMAX_CLI_SOURCE, path };
+}
+
+export function resolveMiniMaxCredentials(): MiniMaxCredentialResolution[] {
+  const credentials: MiniMaxCredentialResolution[] = [];
+  const envKey = usableLiteralSecret(process.env.MINIMAX_API_KEY);
+  credentials.push(
+    envKey
+      ? {
+          status: "available",
+          key: envKey,
+          source: MINIMAX_ENV_SOURCE,
+          baseUrl: configuredBaseUrl(),
+        }
+      : { status: "missing", source: MINIMAX_ENV_SOURCE },
+  );
+
+  const piPath = resolvePiAuthFilePath();
+  const piResult = readBoundedJsonFile(piPath);
+  if (piResult.status === "success") {
+    credentials.push(extractMiniMaxCredential(piResult.value, piPath));
+  } else if (piResult.status === "invalid") {
+    credentials.push({
+      status: piResult.error === "json_parse_error" ? "invalid" : "error",
+      source: MINIMAX_PI_SOURCE,
+      path: piPath,
+      error: piResult.error,
+    });
+  } else {
+    credentials.push({
+      status: "missing",
+      source: MINIMAX_PI_SOURCE,
+      path: piPath,
+    });
+  }
+
+  const cliPath = minimaxConfigPath();
+  const cliResult = readBoundedJsonFile(cliPath);
+  if (cliResult.status === "success") {
+    credentials.push(...extractMiniMaxCliCredentials(cliResult.value, cliPath));
+  } else if (cliResult.status === "invalid") {
+    credentials.push({
+      status: cliResult.error === "json_parse_error" ? "invalid" : "error",
+      source: MINIMAX_CLI_SOURCE,
+      path: cliPath,
+      error: cliResult.error,
+    });
+  } else {
+    credentials.push(missingCliCredential(cliPath));
+  }
+
+  return credentials;
+}
+
+export function createMiniMaxAdapter(
+  overrides: Partial<MiniMaxDependencies> = {},
 ): ProviderAdapter {
-  const dependencies: MinimaxDependencies = {
-    credentialSources: defaultMinimaxCredentialSources(),
-    envApiKey: () => process.env[ENV_MINIMAX_API_KEY],
+  const dependencies: MiniMaxDependencies = {
+    credential: resolveMiniMaxCredentials,
     fetch: providerFetch,
+    readCachedProvider: readCachedProviderFromDisk,
+    deleteCachedProvider: deleteCachedProviderFromDisk,
     now: Date.now,
-    deadlineMs: OPERATION_DEADLINE_MS,
+    deadlineMs: DEADLINE_MS,
     ...overrides,
   };
   return {
     id: "minimax",
     label: LABEL,
-    fetchQuota: (options: ProviderOptions) =>
-      fetchQuotaWithDependencies(dependencies, options),
-    inspectAuth: (_options: ProviderOptions) =>
-      inspectAuthWithDependencies(dependencies),
+    fetchQuota: () => fetchQuotaWithDependencies(dependencies),
+    inspectAuth: () => inspectAuthWithDependencies(dependencies),
   };
 }
 
-export const minimaxAdapter = createMinimaxAdapter();
+export const minimaxAdapter = createMiniMaxAdapter();
 
 async function fetchQuotaWithDependencies(
-  dependencies: MinimaxDependencies,
-  _options: ProviderOptions,
+  dependencies: MiniMaxDependencies,
 ): Promise<ProviderQuota> {
   const attempts: SourceAttempt[] = [];
-  let credentialMissing = true;
-  let definitiveAuth: string | undefined;
-  let readError: string | undefined;
-  let lastError: string | undefined;
-
-  async function tryCredentials(
-    source: string,
-    apiKeys: string[],
-  ): Promise<ProviderQuota | undefined> {
-    const selection = await selectCredential(
-      apiKeys.map((credential) => ({
-        source,
-        credential,
-        localState: "valid" as const,
-      })),
-      async (candidate) => {
-        try {
-          return {
-            kind: "quota",
-            result: await probeMinimax(candidate.credential, dependencies),
-          };
-        } catch (error) {
-          const code = errorCode(error);
-          return {
-            kind: code === "provider_auth_rejected" ? "rejected" : "transient",
-            error: code,
-          };
-        }
-      },
-    );
-    for (const result of selection.results) {
-      if (result.outcome === "not_tried") continue;
-      attempts.push({
-        source,
-        status: result.outcome === "quota" ? "success" : "failed",
-        ...(result.error ? { error: result.error } : {}),
-      });
-    }
-    if (selection.outcome === "quota") {
-      return successMinimaxReport(selection.result!, attempts, dependencies);
-    }
-    const code = selection.transientError ?? selection.results[0]!.error!;
-    if (selection.outcome === "transient") {
-      return failedMinimaxReport(attempts, code);
-    }
-    credentialMissing = false;
-    definitiveAuth = preferDefinitiveAuth(definitiveAuth, code);
-    lastError = code;
-    return undefined;
-  }
-
-  const envKey = usableLiteralSecret(dependencies.envApiKey());
-  if (envKey) {
-    const report = await tryCredentials(ENV_MINIMAX_API_KEY, [envKey]);
-    if (report) return report;
-  }
-
-  for (const source of dependencies.credentialSources) {
-    const resolution = resolveMinimaxCredentialSource(source);
+  let finalFailure: MiniMaxFailure | undefined;
+  let finalResolution: MiniMaxCredentialResolution | undefined;
+  for (const resolution of credentialCandidates(dependencies)) {
     if (resolution.status !== "available") {
-      attempts.push({
-        source: source.name,
+      const failure = credentialFailure(resolution);
+      replaceCredentialAttempt(attempts, resolution.source, {
+        source: resolution.source,
         status: resolution.status === "missing" ? "skipped" : "failed",
-        error: credentialError(resolution),
-        ...(resolution.status !== "missing" ? { credentialPresent: true } : {}),
+        error: failure.code,
       });
-      if (resolution.status !== "missing") {
-        credentialMissing = false;
-        if (resolution.status === "error") {
-          readError ??= credentialError(resolution);
-        } else {
-          definitiveAuth = preferDefinitiveAuth(
-            definitiveAuth,
-            credentialError(resolution),
-          );
-        }
+      if (preferMiniMaxFailure(finalFailure, failure) === failure) {
+        finalFailure = failure;
+        finalResolution = resolution;
       }
-      lastError = credentialError(resolution);
       continue;
     }
 
-    const report = await tryCredentials(source.name, resolution.apiKeys);
-    if (report) return report;
+    try {
+      const payload = await requestMiniMax(
+        resolution.key,
+        resolution.baseUrl,
+        dependencies.fetch,
+        dependencies.deadlineMs,
+      );
+      const normalized = normalizeMiniMaxPayload(payload, resolution.baseUrl);
+      if (
+        normalized.windows.length === 0 &&
+        normalized.credits === undefined &&
+        !isAuthoritativeEmptyMiniMaxAllocation(payload)
+      ) {
+        throw new MiniMaxFailure("quota_missing", { staleEligible: true });
+      }
+      replaceCredentialAttempt(attempts, resolution.source, {
+        source: resolution.source,
+        status: "success",
+      });
+      publishMiniMaxReadingContextId(
+        miniMaxCacheContextId(resolution.source, resolution.baseUrl),
+      );
+      const report = successProvider({
+        provider: "minimax",
+        label: LABEL,
+        source: "api",
+        ...(normalized.plan ? { plan: normalized.plan } : {}),
+        windows: normalized.windows,
+        ...(normalized.credits ? { credits: normalized.credits } : {}),
+        refreshedAt: new Date(dependencies.now()).toISOString(),
+        sourcesTried: sourceNames(attempts),
+        attempts,
+      });
+      if (normalized.untrustedWindowIds) {
+        report.state.untrustedWindowIds = normalized.untrustedWindowIds;
+      }
+      return report;
+    } catch (error) {
+      const failure =
+        error instanceof MiniMaxFailure
+          ? error
+          : new MiniMaxFailure(errorCode(error), { staleEligible: true });
+      replaceCredentialAttempt(attempts, resolution.source, {
+        source: resolution.source,
+        status: "failed",
+        error: failure.code,
+      });
+      if (failure.definitiveAuth) {
+        if (preferMiniMaxAuthFailure(finalFailure, failure) === failure) {
+          finalFailure = failure;
+          finalResolution = resolution;
+        }
+        continue;
+      }
+      if (failure.staleEligible) {
+        try {
+          const cached = dependencies.readCachedProvider(
+            miniMaxCacheContextId(resolution.source, resolution.baseUrl),
+          );
+          if (cached) {
+            return staleFromCache(
+              cached,
+              failure.code,
+              sourceNames(attempts),
+              attempts,
+            );
+          }
+        } catch {
+          // Cache I/O cannot replace the bounded provider failure.
+        }
+      }
+      return failedProvider({
+        provider: "minimax",
+        label: LABEL,
+        status: failure.status,
+        error: failure.code,
+        source: "unavailable",
+        retryAfter: failure.retryAfter,
+        sourcesTried: sourceNames(attempts),
+        attempts,
+      });
+    }
   }
 
-  if (attempts.length === 0) {
-    attempts.push({
-      source: ENV_MINIMAX_API_KEY,
-      status: "skipped",
-      error: "minimax_credential_unavailable",
+  const failure =
+    finalFailure ??
+    new MiniMaxFailure("minimax_credential_unavailable", {
+      status: "auth_required",
+      definitiveAuth: true,
     });
-    lastError = "minimax_credential_unavailable";
+  if (failure.definitiveAuth) {
+    try {
+      dependencies.deleteCachedProvider("minimax");
+    } catch {
+      // Preserve the current definitive auth result.
+    }
+  } else if (failure.staleEligible && finalResolution) {
+    try {
+      const cached = dependencies.readCachedProvider(
+        miniMaxCacheContextId(
+          finalResolution.source,
+          finalResolution.status === "available"
+            ? finalResolution.baseUrl
+            : configuredBaseUrl(),
+        ),
+      );
+      if (cached) {
+        return staleFromCache(
+          cached,
+          failure.code,
+          sourceNames(attempts),
+          attempts,
+        );
+      }
+    } catch {
+      // Cache I/O cannot replace the bounded provider failure.
+    }
+  }
+  return failedProvider({
+    provider: "minimax",
+    label: LABEL,
+    status: failure.status,
+    error: failure.code,
+    source: "unavailable",
+    retryAfter: failure.retryAfter,
+    sourcesTried: sourceNames(attempts),
+    attempts,
+  });
+}
+
+async function inspectAuthWithDependencies(
+  dependencies: MiniMaxDependencies,
+): Promise<AuthProviderReport> {
+  const sources: AuthSourceReport[] = credentialCandidates(dependencies).map(
+    (resolution) => ({
+      source: resolution.source,
+      ...(resolution.path ? { path: resolution.path } : {}),
+      status:
+        resolution.status === "available"
+          ? "available"
+          : resolution.status === "missing"
+            ? "missing"
+            : resolution.status === "error"
+              ? "error"
+              : "invalid",
+      ...(resolution.status !== "available" && resolution.error
+        ? { error: resolution.error }
+        : {}),
+      ...(resolution.status === "available" ? { credentialPresent: true } : {}),
+    }),
+  );
+  return { provider: "minimax", sources };
+}
+
+export function normalizeMiniMaxPayload(
+  raw: unknown,
+  baseUrl?: string,
+): NormalizedMiniMaxPayload {
+  const root = objectValue(raw);
+  if (!root) return { windows: [] };
+  const balanceRoot = objectValue(root.data) ?? root;
+  const balance = numberValue(balanceRoot.available_amount);
+  if (balance !== undefined) {
+    // The China deployment denominates balances in CNY; the response carries
+    // no currency field, so the answering host is the only unit evidence.
+    const unit = miniMaxBalanceUnit(baseUrl);
+    return { windows: [], credits: { remaining: balance, unit } };
   }
 
-  return failedMinimaxReport(
-    attempts,
-    readError ?? definitiveAuth ?? lastError ?? "minimax_quota_failed",
-    credentialMissing && !definitiveAuth,
+  const data = objectValue(root.data) ?? root;
+  const rows =
+    data && Array.isArray(data.model_remains) ? data.model_remains : [];
+  const windows: QuotaWindow[] = [];
+  const untrustedWindowIds: string[] = [];
+  for (const [offset, row] of rows.entries()) {
+    const recognized = normalizeModelRemain(row);
+    if (recognized.length > 0 || isNoAllocationModelRemain(row)) {
+      windows.push(...recognized);
+      continue;
+    }
+    const id = `limit:${offset + 1}`;
+    windows.push({ id, label: `limit ${offset + 1}`, kind: "unknown" });
+    untrustedWindowIds.push(id);
+  }
+  const plan = firstString(data, ["plan", "plan_name", "planName"]);
+  return {
+    windows,
+    ...(plan ? { plan } : {}),
+    ...(untrustedWindowIds.length > 0 ? { untrustedWindowIds } : {}),
+  };
+}
+
+function miniMaxBalanceUnit(baseUrl: string | undefined): "usd" | "cny" {
+  try {
+    return new URL(baseUrl ?? MINIMAX_GLOBAL_BASE_URL).hostname ===
+      new URL(MINIMAX_CHINA_BASE_URL).hostname
+      ? "cny"
+      : "usd";
+  } catch {
+    return "usd";
+  }
+}
+
+function normalizeModelRemain(raw: unknown): QuotaWindow[] {
+  const row = objectValue(raw);
+  const modelName = stringValue(row?.model_name);
+  if (!row || !modelName) return [];
+  const modelId = modelSlug(modelName);
+  if (!modelId) return [];
+  const interval = normalizeModelWindow(
+    row,
+    modelId,
+    modelName,
+    "current_interval",
+  );
+  const weekly = normalizeModelWindow(
+    row,
+    modelId,
+    modelName,
+    "current_weekly",
+  );
+  return [interval, weekly].filter(
+    (window): window is QuotaWindow => window !== undefined,
   );
 }
 
-function preferDefinitiveAuth(
-  current: string | undefined,
-  next: string,
-): string {
-  if (!current) return next;
-  if (current === "provider_auth_rejected") return current;
-  if (next === "provider_auth_rejected") return next;
-  return current;
+function normalizeModelWindow(
+  row: Record<string, unknown>,
+  modelId: string,
+  modelName: string,
+  prefix: "current_interval" | "current_weekly",
+): QuotaWindow | undefined {
+  const status = numberValue(row[`${prefix}_status`]);
+  const total = numberValue(row[`${prefix}_total_count`]);
+  const reported = numberValue(row[`${prefix}_usage_count`]);
+  if (isNoAllocationModelWindow(row, prefix)) return undefined;
+
+  const startKey =
+    prefix === "current_interval" ? "start_time" : "weekly_start_time";
+  const endKey = prefix === "current_interval" ? "end_time" : "weekly_end_time";
+  if (
+    ![
+      `${prefix}_status`,
+      `${prefix}_total_count`,
+      `${prefix}_usage_count`,
+      `${prefix}_remaining_percent`,
+      startKey,
+      endKey,
+    ].some((key) => Object.hasOwn(row, key))
+  ) {
+    return undefined;
+  }
+  const startsAt = parseEpoch(row[startKey]);
+  const resetsAt = parseEpoch(row[endKey]);
+  const windowSeconds =
+    startsAt && resetsAt
+      ? (Date.parse(resetsAt) - Date.parse(startsAt)) / 1000
+      : undefined;
+  const explicit = numberValue(row[`${prefix}_remaining_percent`]);
+  const percentRemaining =
+    explicit !== undefined
+      ? clampPercent(explicit)
+      : remainingFromCounts(reported, total);
+  const identity = miniMaxWindowIdentity(prefix, windowSeconds);
+  const remaining = percentRemaining ?? (status === 2 ? 0 : undefined);
+  return {
+    id: `model:${modelId}:${identity.idSuffix}`,
+    label: `${modelName} ${identity.label}`,
+    kind: "model",
+    ...(remaining !== undefined
+      ? {
+          percentUsed: clampPercent(100 - remaining),
+          percentRemaining: remaining,
+        }
+      : {}),
+    ...(startsAt ? { startsAt } : {}),
+    ...(resetsAt ? { resetsAt } : {}),
+    ...(windowSeconds !== undefined && windowSeconds > 0
+      ? { windowSeconds }
+      : {}),
+  };
 }
 
-async function probeMinimax(
-  apiKey: string,
-  dependencies: MinimaxDependencies,
-): Promise<NormalizedMinimaxProbe> {
-  const url = `https://${MINIMAX_HOST}${MINIMAX_PROBE_PATH}`;
+function isAuthoritativeEmptyMiniMaxAllocation(payload: unknown): boolean {
+  const root = objectValue(payload);
+  const data = objectValue(objectValue(root)?.data) ?? root;
+  const rows =
+    data && Array.isArray(data.model_remains) ? data.model_remains : [];
+  return rows.length > 0 && rows.every(isNoAllocationModelRemain);
+}
+
+function isNoAllocationModelRemain(raw: unknown): boolean {
+  const row = objectValue(raw);
+  return (
+    row !== undefined &&
+    stringValue(row.model_name) !== undefined &&
+    isNoAllocationModelWindow(row, "current_interval") &&
+    isNoAllocationModelWindow(row, "current_weekly")
+  );
+}
+
+function isNoAllocationModelWindow(
+  row: Record<string, unknown>,
+  prefix: "current_interval" | "current_weekly",
+): boolean {
+  return (
+    numberValue(row[`${prefix}_status`]) === 3 &&
+    numberValue(row[`${prefix}_total_count`]) === 0 &&
+    numberValue(row[`${prefix}_usage_count`]) === 0
+  );
+}
+
+function miniMaxWindowIdentity(
+  prefix: "current_interval" | "current_weekly",
+  windowSeconds: number | undefined,
+): { idSuffix: string; label: string } {
+  if (windowSeconds === 18_000) return { idSuffix: "5h", label: "5h" };
+  if (windowSeconds === 604_800) return { idSuffix: "7d", label: "7d" };
+  if (windowSeconds !== undefined && windowSeconds > 0) {
+    const label = formatMiniMaxWindowSeconds(windowSeconds);
+    return { idSuffix: `window:${label}`, label };
+  }
+  return prefix === "current_weekly"
+    ? { idSuffix: "window:weekly", label: "weekly" }
+    : { idSuffix: "window:current_interval", label: "current interval" };
+}
+
+function formatMiniMaxWindowSeconds(seconds: number): string {
+  if (Number.isInteger(seconds / 86_400)) return `${seconds / 86_400}d`;
+  if (Number.isInteger(seconds / 3_600)) return `${seconds / 3_600}h`;
+  if (Number.isInteger(seconds / 60)) return `${seconds / 60}m`;
+  return `${seconds}s`;
+}
+
+function remainingFromCounts(
+  reported: number | undefined,
+  total: number | undefined,
+): number | undefined {
+  if (
+    reported === undefined ||
+    total === undefined ||
+    total <= 0 ||
+    reported < 0 ||
+    reported > total
+  )
+    return undefined;
+  // MiniMax's official CLI preserves the legacy meaning of usage_count when
+  // no explicit percentage is present: it is the remaining count.
+  return clampPercent((reported / total) * 100);
+}
+
+async function requestMiniMax(
+  key: string,
+  baseUrl: string,
+  fetchImplementation: typeof globalThis.fetch,
+  deadlineMs: number,
+): Promise<unknown> {
+  const apiKey = key.startsWith("sk-api-");
+  const url = `${baseUrl}${apiKey ? MINIMAX_BALANCE_PATH : MINIMAX_QUOTA_PATH}`;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), dependencies.deadlineMs);
+  const timer = setTimeout(() => controller.abort(), deadlineMs);
+  let response: Response | undefined;
   try {
-    const response = await dependencies.fetch(url, {
+    response = await fetchImplementation(url, {
       method: "GET",
       headers: {
-        Authorization: `Bearer ${apiKey}`,
+        Authorization: `Bearer ${key}`,
         Accept: "application/json",
       },
       credentials: "omit",
       redirect: "manual",
       signal: controller.signal,
     });
-    if (response.status === 401 || response.status === 403) {
-      throw new Error("provider_auth_rejected");
+    if (!response.ok) {
+      await cancelBody(response);
+      if (response.status === 401 || response.status === 403)
+        throw new MiniMaxFailure("provider_auth_rejected", {
+          status: "auth_required",
+          definitiveAuth: true,
+        });
+      if (response.status === 429)
+        throw new MiniMaxFailure("provider_rate_limited", {
+          status: "rate_limited",
+          staleEligible: true,
+          retryAfter: retryAfterToIso(response.headers.get("retry-after")),
+        });
+      throw new MiniMaxFailure("provider_request_rejected", {
+        staleEligible: true,
+      });
     }
-    if (response.status === 429) throw new Error("provider_rate_limited");
-    if (!response.ok) throw new Error("provider_request_rejected");
     const body = await readBoundedResponseBody(
       response,
       controller.signal,
-      (code) => new Error(code),
+      (code) => new MiniMaxFailure(code, { staleEligible: true }),
     );
-    let payload: unknown;
     try {
-      payload = JSON.parse(
+      const parsed = JSON.parse(
         new TextDecoder("utf-8", { fatal: true }).decode(body),
-      );
-    } catch {
-      throw new Error("malformed_json");
+      ) as unknown;
+      rejectMiniMaxApplicationError(parsed);
+      return parsed;
+    } catch (error) {
+      if (error instanceof MiniMaxFailure) throw error;
+      throw new MiniMaxFailure("malformed_json", { staleEligible: true });
     }
-    const baseResponse = objectValue(objectValue(payload)?.base_resp);
-    if (numericValue(baseResponse?.status_code) !== undefined) {
-      const statusCode = numericValue(baseResponse?.status_code)!;
-      if (statusCode !== 0) {
-        throw new Error(
-          statusCode === 1004
-            ? "provider_auth_rejected"
-            : "provider_request_rejected",
-        );
-      }
-    }
-    return normalizeMinimaxProbe(payload);
   } catch (error) {
-    if (controller.signal.aborted) {
-      throw new Error("provider_timeout", { cause: error });
-    }
-    if (
-      error instanceof Error &&
-      [
-        "provider_auth_rejected",
-        "provider_rate_limited",
-        "provider_request_rejected",
-        "response_too_large",
-        "response_size_unverifiable",
-        "malformed_json",
-        "provider_timeout",
-      ].includes(error.message)
-    ) {
-      throw error;
-    }
-    throw new Error("network_unavailable", { cause: error });
+    if (controller.signal.aborted)
+      throw new MiniMaxFailure("provider_timeout", { staleEligible: true });
+    if (error instanceof MiniMaxFailure) throw error;
+    throw new MiniMaxFailure("network_unavailable", { staleEligible: true });
   } finally {
-    controller.abort();
     clearTimeout(timer);
   }
 }
 
-function normalizeMinimaxProbe(raw: unknown): NormalizedMinimaxProbe {
-  const root = objectValue(raw);
-  if (!root) return { windows: [], untrustedWindowIds: [] };
-  const data = objectValue(root.data) ?? root;
-  const models = Array.isArray(data.model_remains) ? data.model_remains : [];
-  const windows: QuotaWindow[] = [];
-  const untrustedWindowIds: string[] = [];
-
-  for (const [index, candidate] of models.entries()) {
-    const model = objectValue(candidate);
-    if (!model) continue;
-    const name = stringValue(model.model_name) ?? `${index + 1}`;
-    const prefix = `model:${name}`;
-    for (const period of [
-      {
-        id: "interval",
-        label: "interval",
-        kind: "session" as const,
-        remainingPercent: "current_interval_remaining_percent",
-        total: "current_interval_total_count",
-        usage: "current_interval_usage_count",
-        remaining: "current_interval_remain_count",
-        resetsAt: ["end_time", "current_interval_end_time"],
-        remainsTime: "remains_time",
-      },
-      {
-        id: "weekly",
-        label: "weekly",
-        kind: "weekly" as const,
-        remainingPercent: "current_weekly_remaining_percent",
-        total: "current_weekly_total_count",
-        usage: "current_weekly_usage_count",
-        remaining: "current_weekly_remain_count",
-        resetsAt: ["weekly_end_time"],
-        remainsTime: "weekly_remains_time",
-      },
-    ]) {
-      const id = `${prefix}:${period.id}`;
-      const measurement = minimaxMeasurement(model, period);
-      if (measurement === "invalid") {
-        untrustedWindowIds.push(id);
-        continue;
-      }
-      if (!measurement) continue;
-      const resetsAt = parseEpochOrIso(
-        period.resetsAt
-          .map((field) => model[field])
-          .find((value) => value != null),
-      );
-      const resetText = remainsText(model[period.remainsTime]);
-      windows.push({
-        id,
-        label: `${name} ${period.label}`,
-        kind: period.kind,
-        ...measurement,
-        ...(resetsAt ? { resetsAt } : {}),
-        ...(resetText ? { resetText } : {}),
-      });
-    }
-  }
-
-  return {
-    windows,
-    untrustedWindowIds,
-  };
-}
-
-type MinimaxPeriod = {
-  id: string;
-  label: string;
-  kind: "session" | "weekly";
-  remainingPercent: string;
-  total: string;
-  usage: string;
-  remaining: string;
-  resetsAt: readonly string[];
-  remainsTime: string;
-};
-
-function minimaxMeasurement(
-  model: Record<string, unknown>,
-  period: MinimaxPeriod,
-):
-  | Pick<QuotaWindow, "percentUsed" | "percentRemaining">
-  | "invalid"
-  | undefined {
-  const remainingPercent = numericValue(model[period.remainingPercent]);
-  const total = numericValue(model[period.total]);
-  const usageRemaining = numericValue(model[period.usage]);
-  const remaining = numericValue(model[period.remaining]);
-  if (
-    total !== undefined &&
-    total > 0 &&
-    ((usageRemaining !== undefined &&
-      (usageRemaining < 0 || usageRemaining > total)) ||
-      (remaining !== undefined && (remaining < 0 || remaining > total)) ||
-      (usageRemaining !== undefined &&
-        remaining !== undefined &&
-        usageRemaining !== remaining))
-  )
-    return "invalid";
-
-  if (remainingPercent !== undefined) {
-    if (remainingPercent < 0 || remainingPercent > 100) return "invalid";
-    return {
-      percentUsed: 100 - remainingPercent,
-      percentRemaining: remainingPercent,
-    };
-  }
-  if (
-    total === undefined &&
-    usageRemaining === undefined &&
-    remaining === undefined
-  )
-    return undefined;
-  if (
-    total === undefined ||
-    total <= 0 ||
-    (usageRemaining === undefined && remaining === undefined)
-  )
-    return "invalid";
-
-  const percentRemaining = ((usageRemaining ?? remaining!) / total) * 100;
-  return { percentUsed: 100 - percentRemaining, percentRemaining };
-}
-
-function remainsText(value: unknown): string | undefined {
-  const milliseconds = numericValue(value);
-  if (milliseconds === undefined || milliseconds < 0) return undefined;
-  const totalMinutes = Math.floor(milliseconds / (60 * 1000));
-  const days = Math.floor(totalMinutes / (24 * 60));
-  const hours = Math.floor((totalMinutes % (24 * 60)) / 60);
-  const minutes = totalMinutes % 60;
-  const parts = [
-    ...(days > 0 ? [`${days}d`] : []),
-    ...(hours > 0 ? [`${hours}h`] : []),
-    ...(minutes > 0 ? [`${minutes}m`] : []),
-  ];
-  return `${parts.length > 0 ? parts.join(" ") : "0m"} remaining`;
-}
-
-function numericValue(value: unknown): number | undefined {
-  if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
-  return value;
-}
-
-function successMinimaxReport(
-  probe: NormalizedMinimaxProbe,
-  attempts: SourceAttempt[],
-  dependencies: MinimaxDependencies,
-): ProviderQuota {
-  const base = successProvider({
-    provider: "minimax",
-    label: LABEL,
-    source: "api",
-    windows: probe.windows,
-    refreshedAt: new Date(dependencies.now()).toISOString(),
-    sourcesTried: sourceNames(attempts),
-    attempts,
-  });
-  return {
-    ...base,
-    state: {
-      ...base.state,
-      authStatus: "usable",
-      ...(probe.untrustedWindowIds.length > 0
-        ? { untrustedWindowIds: probe.untrustedWindowIds }
-        : {}),
-    },
-  };
-}
-
-function failedMinimaxReport(
-  attempts: SourceAttempt[],
-  error: string,
-  credentialMissing = false,
-): ProviderQuota {
-  const status = credentialMissing ? "auth_required" : statusFromError(error);
-  const report = failedProvider({
-    provider: "minimax",
-    label: LABEL,
-    status,
-    error,
-    sourcesTried: sourceNames(attempts),
-    attempts,
-  });
-  if (status === "auth_required") return report;
-  return withUsageFetchFailure(report);
-}
-
-function inspectAuthWithDependencies(
-  dependencies: MinimaxDependencies,
-): Promise<AuthProviderReport> {
-  const sources: AuthSourceReport[] = [];
-  const envKey = usableLiteralSecret(dependencies.envApiKey());
-  sources.push({
-    source: ENV_MINIMAX_API_KEY,
-    status: envKey ? "available" : "missing",
-  });
-  for (const source of dependencies.credentialSources) {
-    const inspection = inspectMinimaxCredentialSource(source);
-    sources.push({
-      source: source.name,
-      path: inspection.path,
-      status: inspection.status,
-      ...(inspection.status === "invalid" || inspection.status === "error"
-        ? { error: inspection.error }
-        : {}),
+function rejectMiniMaxApplicationError(payload: unknown): void {
+  const baseResp = objectValue(payload)?.base_resp;
+  const statusCode = numberValue(objectValue(baseResp)?.status_code);
+  if (statusCode === undefined || statusCode === 0) return;
+  if (statusCode === 1004 || statusCode === 2049) {
+    throw new MiniMaxFailure("provider_auth_rejected", {
+      status: "auth_required",
+      definitiveAuth: true,
     });
   }
-  return Promise.resolve({ provider: "minimax", sources });
+  if (statusCode === 1002) {
+    throw new MiniMaxFailure("provider_rate_limited", {
+      status: "rate_limited",
+      staleEligible: true,
+    });
+  }
+  throw new MiniMaxFailure("provider_request_rejected", {
+    staleEligible: true,
+  });
 }
 
-function credentialError(
-  resolution: Exclude<MinimaxCredentialResolution, { status: "available" }>,
-): string {
-  switch (resolution.status) {
-    case "missing":
-      return "minimax_credential_unavailable";
-    case "invalid":
-      return `minimax_credential_invalid: ${resolution.error}`;
-    case "error":
-      return `credential_resolution_failed: ${resolution.error}`;
+async function cancelBody(response: Response): Promise<void> {
+  try {
+    await response.body?.cancel();
+  } catch {
+    // Releasing a rejected response body is best effort.
   }
 }
 
-function errorCode(error: unknown): string {
-  return error instanceof Error && error.message
-    ? error.message
-    : "minimax_quota_failed";
+function credentialCandidates(
+  dependencies: MiniMaxDependencies,
+): MiniMaxCredentialResolution[] {
+  const credentials = dependencies.credential();
+  return Array.isArray(credentials) ? credentials : [credentials];
 }
 
-function statusFromError(error: string) {
-  if (
-    error === "keychain_prompt_required" ||
-    error === "credentials_expired" ||
-    error === "provider_auth_rejected" ||
-    error.startsWith("minimax_credential_invalid") ||
-    /sign-in|required|reauth|access token expired/i.test(error)
-  )
-    return "auth_required";
-  if (/rate.?limit/i.test(error)) return "rate_limited";
-  return "error";
+function preferMiniMaxFailure(
+  current: MiniMaxFailure | undefined,
+  next: MiniMaxFailure,
+): MiniMaxFailure {
+  if (!current || (current.definitiveAuth && !next.definitiveAuth)) return next;
+  return current;
+}
+
+// An empirical provider rejection outweighs a local absent/invalid
+// diagnostic, but never an error-status resolution failure.
+function preferMiniMaxAuthFailure(
+  current: MiniMaxFailure | undefined,
+  next: MiniMaxFailure,
+): MiniMaxFailure {
+  if (current && !current.definitiveAuth) return current;
+  return next;
+}
+
+function replaceCredentialAttempt(
+  attempts: SourceAttempt[],
+  source: string,
+  attempt: SourceAttempt,
+): void {
+  for (let index = attempts.length - 1; index >= 0; index -= 1) {
+    if (attempts[index].source === source) {
+      attempts[index] = attempt;
+      return;
+    }
+  }
+  attempts.push(attempt);
+}
+
+/**
+ * The cache identity a reading from this credential belongs to: the source
+ * that produced it plus the deployment host its resolution implies, so one
+ * account's snapshot can never serve another source's or host's stale read.
+ * A resolution that could not produce a credential still names the source and
+ * the deployment the environment implies, which is all a stale read can ask.
+ */
+function miniMaxCacheContextId(source: string, baseUrl: string): string {
+  return createHash("sha256")
+    .update(`minimax-source:${source}\nbase:${baseUrl}`)
+    .digest("hex");
+}
+
+function credentialFailure(
+  resolution: Exclude<MiniMaxCredentialResolution, { status: "available" }>,
+): MiniMaxFailure {
+  if (resolution.status === "missing")
+    return new MiniMaxFailure("minimax_credential_unavailable", {
+      status: "auth_required",
+      definitiveAuth: true,
+    });
+  if (resolution.status === "invalid")
+    return new MiniMaxFailure("minimax_credential_invalid", {
+      status: "auth_required",
+      definitiveAuth: true,
+    });
+  return new MiniMaxFailure("credential_resolution_failed", {
+    staleEligible: true,
+  });
+}
+
+function configuredBaseUrl(): string {
+  return safeBaseUrl(process.env.MINIMAX_BASE_URL) ?? MINIMAX_GLOBAL_BASE_URL;
+}
+
+function configBaseUrl(root: Record<string, unknown>): string {
+  const explicit =
+    safeBaseUrl(stringValue(root.base_url)) ??
+    safeBaseUrl(stringValue(objectValue(root.oauth)?.resource_url));
+  if (explicit) return explicit;
+  return stringValue(root.region)?.toLowerCase() === "cn"
+    ? MINIMAX_CHINA_BASE_URL
+    : configuredBaseUrl();
+}
+
+function safeBaseUrl(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol !== "https:" || parsed.username || parsed.password)
+      return undefined;
+    if (
+      parsed.hostname !== "api.minimax.io" &&
+      parsed.hostname !== "api.minimaxi.com"
+    )
+      return undefined;
+    return parsed.origin;
+  } catch {
+    return undefined;
+  }
+}
+
+function readBoundedJsonFile(path: string): JsonFileReadResult {
+  let text: string;
+  try {
+    const size = statSync(path).size;
+    if (size > CONFIG_FILE_LIMIT_BYTES)
+      return { status: "invalid", error: "file_too_large" };
+    text = readFileSync(path, "utf8");
+  } catch (error) {
+    const code = objectValue(error)?.code;
+    return code === "ENOENT"
+      ? { status: "missing" }
+      : { status: "invalid", error: "file_read_error" };
+  }
+  if (Buffer.byteLength(text, "utf8") > CONFIG_FILE_LIMIT_BYTES)
+    return { status: "invalid", error: "file_too_large" };
+  try {
+    return { status: "success", value: JSON.parse(text) };
+  } catch {
+    return { status: "invalid", error: "json_parse_error" };
+  }
+}
+
+function extractKey(
+  entry: Record<string, unknown> | undefined,
+): string | undefined {
+  if (!entry) return undefined;
+  for (const field of ["key", "apiKey", "api_key", "access", "accessToken"]) {
+    const key = usableLiteralSecret(entry[field]);
+    if (key) return key;
+  }
+  return undefined;
+}
+
+function parseEpoch(value: unknown): string | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    const milliseconds = value > 10_000_000_000 ? value : value * 1_000;
+    const date = new Date(milliseconds);
+    return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
+  }
+  if (typeof value !== "string" || value.trim() === "") return undefined;
+  const numeric = Number(value);
+  if (Number.isFinite(numeric)) return parseEpoch(numeric);
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
+}
+
+function modelSlug(value: string): string {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9.-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
 }
 
 function objectValue(value: unknown): Record<string, unknown> | undefined {
@@ -645,4 +865,41 @@ function objectValue(value: unknown): Record<string, unknown> | undefined {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function firstString(
+  value: Record<string, unknown> | undefined,
+  keys: string[],
+): string | undefined {
+  return value
+    ? keys.map((key) => stringValue(value[key])).find(Boolean)
+    : undefined;
+}
+
+function numberValue(value: unknown): number | undefined {
+  if (typeof value !== "number" && typeof value !== "string") return undefined;
+  if (typeof value === "string" && value.trim() === "") return undefined;
+  const parsed = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function errorCode(error: unknown): string {
+  return error instanceof MiniMaxFailure ? error.code : "quota_request_failed";
+}
+
+class MiniMaxFailure extends Error {
+  readonly code: string;
+  readonly status: ProviderStatus;
+  readonly staleEligible: boolean;
+  readonly definitiveAuth: boolean;
+  readonly retryAfter?: string;
+
+  constructor(code: string, options: MiniMaxFailureOptions = {}) {
+    super(code);
+    this.code = code;
+    this.status = options.status ?? "error";
+    this.staleEligible = options.staleEligible ?? false;
+    this.definitiveAuth = options.definitiveAuth ?? false;
+    this.retryAfter = options.retryAfter;
+  }
 }

@@ -9,6 +9,7 @@ import {
 import { kimiReadingContextId } from "./providers/kimi-cache-context.js";
 import { commandCodeReadingContextId } from "./providers/commandcode-cache-context.js";
 import { elevenLabsReadingContextId } from "./providers/elevenlabs-cache-context.js";
+import { miniMaxReadingContextId } from "./providers/minimax-cache-context.js";
 import { isPiCodexSource } from "./providers/pi-codex-credential.js";
 import type {
   ProviderId,
@@ -59,10 +60,10 @@ const CREDENTIAL_CONTEXT_ID = /^[a-f0-9]{64}$/;
  * cache slot alone does not say: a Claude profile selects the credential store,
  * a Kimi Code `config.toml` selects the deployment, Command Code's `whoami`
  * identifies the source-plus-account pair, an ElevenLabs API key is itself the
- * account, and a Codex slot can be signed in to another ChatGPT account. A
- * snapshot from one such context says nothing about another, so each is stamped
- * on write and
- * checked on stale reuse - strictly for Claude, Kimi, Command Code,
+ * account, MiniMax stamps by credential source plus deployment host, and a
+ * Codex slot can be signed in to another ChatGPT account. A snapshot from one
+ * such context says nothing about another, so each is stamped on write and
+ * checked on stale reuse - strictly for Claude, Kimi, Command Code, MiniMax,
  * and ElevenLabs, whose identity a reading always has (and which skip write
  * and clear when that identity is missing), and on proven mismatch for Codex,
  * whose stored account id is optional.
@@ -80,7 +81,8 @@ const CREDENTIAL_CONTEXT_ID = /^[a-f0-9]{64}$/;
  * can only name the accounts the credentials still store, so the stamp is the
  * stored id of the one credential that answered (not the vendor's response id,
  * which can differ while the token is the same) hashed because the cache holds
- * no account identity in the clear. ElevenLabs publishes
+ * no account identity in the clear. MiniMax publishes the answering credential
+ * source plus the deployment host its resolution implies. ElevenLabs publishes
  * a one-way digest of the key that answered, because that key is the only thing
  * naming the subscription and its single slot would otherwise be shared by
  * every key.
@@ -93,6 +95,7 @@ const CONTEXT_SCOPED_PROVIDERS: Partial<
   commandcode: commandCodeReadingContextId,
   elevenlabs: elevenLabsReadingContextId,
   codex: codexStampContextId,
+  minimax: miniMaxReadingContextId,
 };
 
 /**
@@ -209,6 +212,17 @@ export function readCachedCommandCodeProvider(
   contextId: string,
 ): ProviderQuota | undefined {
   return readCachedProviderInContext("commandcode", contextId);
+}
+
+/**
+ * MiniMax stale quota may only be reused when the cache record proves it was
+ * captured from the same credential source and deployment host the caller is
+ * asking about.
+ */
+export function readCachedMiniMaxProvider(
+  contextId: string,
+): ProviderQuota | undefined {
+  return readCachedProviderInContext("minimax", contextId);
 }
 
 /**
@@ -362,7 +376,7 @@ function toCacheProvider(provider: ProviderQuota): CachedProvider | undefined {
   )?.snapshot;
   if (!snapshot) return undefined;
   const contextId = CONTEXT_SCOPED_PROVIDERS[provider.provider]?.(provider);
-  // Claude, Kimi, Command Code, and ElevenLabs require a published
+  // Claude, Kimi, Command Code, MiniMax, and ElevenLabs require a published
   // identity; Codex stamps are optional and withheld only on proven mismatch
   // at read time.
   if (
@@ -378,7 +392,7 @@ function toCacheProvider(provider: ProviderQuota): CachedProvider | undefined {
 }
 
 function missingRequiredContext(provider: ProviderId): boolean {
-  // Codex stamps are optional; Claude, Kimi, Command Code, and
+  // Codex stamps are optional; Claude, Kimi, Command Code, MiniMax, and
   // ElevenLabs must
   // not clear when the current reading has no published context identity.
   if (provider === "codex") return false;

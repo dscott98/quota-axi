@@ -3,6 +3,13 @@ import { constants } from "node:fs";
 import { access, stat } from "node:fs/promises";
 import * as path from "node:path";
 
+/**
+ * Run a command and resolve its stdout as text. On failure the rejection is
+ * Node's own error (message preserved for existing consumers) enriched with
+ * `commandStdout`/`commandStderr` from the callback outputs, so callers can
+ * parse vendor error bodies without relying on fields on Node's error or
+ * extracting them from its combined command-failure message.
+ */
 export function execFileText(
   command: string,
   args: string[],
@@ -26,9 +33,15 @@ export function execFileText(
         maxBuffer: 16 * 1024 * 1024,
         ...(invocation.environment ? { env: invocation.environment } : {}),
       },
-      (error, stdout) => {
+      (error, stdout, stderr) => {
         if (error) {
-          reject(error);
+          const enriched = error as Error & {
+            commandStdout?: string;
+            commandStderr?: string;
+          };
+          enriched.commandStdout = String(stdout ?? "");
+          enriched.commandStderr = String(stderr ?? "");
+          reject(enriched);
           return;
         }
         resolve(String(stdout));
