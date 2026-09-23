@@ -321,6 +321,92 @@ describe("Alibaba bl usage provider", () => {
       ],
     });
   });
+
+  it("reports an authenticated empty usage body as no quota, not malformed", async () => {
+    const argsFile = join(tempDir, "args");
+    installMockBl(argsFile, "{}");
+    process.env.PATH = tempDir;
+
+    const report = await createAlibabaAdapter().fetchQuota(OPTIONS);
+
+    expect(report).toMatchObject({
+      provider: "alibaba",
+      source: "cli",
+      windows: [],
+      state: {
+        status: "fresh",
+        stale: false,
+        authStatus: "usable",
+      },
+      attempts: [{ source: "bl-cli", status: "success" }],
+    });
+  });
+
+  it("classifies an expired console session as auth_required with the bl login remedy", async () => {
+    const argsFile = join(tempDir, "args");
+    installMockBlError(
+      argsFile,
+      JSON.stringify({
+        error: {
+          code: 3,
+          message: "Console session is not logged in or has expired.",
+          hint: "Run `bl auth login --console` to sign in or refresh your console session.",
+        },
+      }),
+      3,
+    );
+    process.env.PATH = tempDir;
+
+    const report = await createAlibabaAdapter().fetchQuota(OPTIONS);
+
+    expect(report).toMatchObject({
+      provider: "alibaba",
+      source: "unavailable",
+      windows: [],
+      state: {
+        status: "auth_required",
+        error: "bl_console_session_expired",
+        remedyCommand: "bl auth login --console",
+      },
+      attempts: [
+        {
+          source: "bl-cli",
+          status: "failed",
+          error: "bl_console_session_expired",
+        },
+      ],
+    });
+    expect(JSON.stringify(report)).not.toContain("Command failed");
+  });
+
+  it("states the vendor's structured error message instead of the command blob", async () => {
+    const argsFile = join(tempDir, "args");
+    installMockBlError(
+      argsFile,
+      JSON.stringify({
+        error: { code: 8, message: "upstream rate limit exceeded" },
+      }),
+      8,
+    );
+    process.env.PATH = tempDir;
+
+    const report = await createAlibabaAdapter().fetchQuota(OPTIONS);
+
+    expect(report).toMatchObject({
+      state: {
+        status: "rate_limited",
+        error: "bl_usage_failed: upstream rate limit exceeded",
+      },
+      attempts: [
+        {
+          source: "bl-cli",
+          status: "failed",
+          error: "bl_usage_failed: upstream rate limit exceeded",
+        },
+      ],
+    });
+    expect(report.state.error).not.toMatch(/\n/);
+  });
 });
 
 function readFixture(): string {
@@ -340,6 +426,28 @@ function installMockBl(argsFile: string, output: string, fail = false): void {
       "#!/bin/sh",
       `printf '%s\\n' "$@" > ${shellQuote(argsFile)}`,
       fail ? "exit 7" : `printf '%s' ${shellQuote(output)}`,
+      "",
+    ].join("\n"),
+  );
+  chmodSync(script, 0o755);
+}
+
+/** Mirror the real CLI's failure shape: a JSON error body on stderr. */
+function installMockBlError(
+  argsFile: string,
+  stderrBody: string,
+  exitCode: number,
+): void {
+  const script = join(tempDir, "bl");
+  const shellQuote = (value: string): string =>
+    `'${value.replaceAll("'", "'\\''")}'`;
+  writeFileSync(
+    script,
+    [
+      "#!/bin/sh",
+      `printf '%s\\n' "$@" > ${shellQuote(argsFile)}`,
+      `printf '%s' ${shellQuote(stderrBody)} >&2`,
+      `exit ${exitCode}`,
       "",
     ].join("\n"),
   );

@@ -20,6 +20,14 @@ const BL_SOURCE = "bl-cli";
 const BL_ARGS = ["usage", "token-plan", "--output", "json"];
 const BL_TIMEOUT_MS = 15_000;
 const LABEL = "Alibaba Coding Plan";
+/**
+ * `bl` exits non-zero with a structured JSON error body on stderr. The
+ * observed session failure is code 3 ("Console session is not logged in or
+ * has expired.") whose own hint names this remedy; quota-axi classifies it as a
+ * sign-in need instead of an opaque command failure, and stays read-only.
+ */
+const BL_ERROR_SESSION_EXPIRED = "bl_console_session_expired";
+export const BL_CONSOLE_LOGIN_REMEDY = "bl auth login --console";
 
 type AlibabaDependencies = {
   findCommandPath: typeof processUtils.findCommandPath;
@@ -86,6 +94,15 @@ async function fetchQuotaWithDependencies(
       BL_TIMEOUT_MS,
     );
     const raw = JSON.parse(output);
+    // An authenticated `bl` that answers with a bare empty object is the
+    // vendor serving no usage data for a live session - the same established
+    // empty reading Kimi's `/usages` produces - not a malformed payload, so it
+    // reports a usable provider with no windows rather than an error that
+    // would read as the subscription being gone.
+    if (isEstablishedEmptyAlibabaUsage(raw)) {
+      attempts[0] = { source: BL_SOURCE, status: "success" };
+      return noQuotaReport(attempts, dependencies);
+    }
     if (!isAlibabaUsagePayload(raw)) throw new Error("bl_usage_malformed_json");
     const normalized = normalizeAlibabaUsage(raw);
 
@@ -101,21 +118,141 @@ async function fetchQuotaWithDependencies(
       attempts,
     });
   } catch (error) {
-    const message = errorMessage(error);
+    const failure = classifyBlFailure(error);
     if (attempts[0]?.status !== "skipped")
-      attempts[0] = { source: BL_SOURCE, status: "failed", error: message };
-    return failedProvider({
+      attempts[0] = {
+        source: BL_SOURCE,
+        status: "failed",
+        error: failure.error,
+      };
+    const report = failedProvider({
       provider: "alibaba",
       label: LABEL,
       status:
-        message === "bl_cli_unavailable"
+        failure.error === "bl_cli_unavailable"
           ? "unavailable"
-          : statusFromError(message),
-      error: message,
+          : failure.sessionExpired
+            ? "auth_required"
+            : statusFromError(failure.error),
+      error: failure.error,
       sourcesTried: sourceNames(attempts),
       attempts,
     });
+    return failure.sessionExpired
+      ? {
+          ...report,
+          state: { ...report.state, remedyCommand: BL_CONSOLE_LOGIN_REMEDY },
+        }
+      : report;
   }
+}
+
+/**
+ * The authenticated no-data reading: the session answered, so the provider is
+ * usable, but the vendor served no usage windows to measure. Mirrors Kimi's
+ * `live_no_quota` report - fresh, no windows, `authStatus: "usable"` - and,
+ * like every fresh reading with no windows, clears rather than preserves the
+ * provider's cache slot.
+ */
+function noQuotaReport(
+  attempts: SourceAttempt[],
+  dependencies: AlibabaDependencies,
+): ProviderQuota {
+  return {
+    provider: "alibaba",
+    label: LABEL,
+    source: "cli",
+    windows: [],
+    state: {
+      status: "fresh",
+      stale: false,
+      refreshedAt: new Date(dependencies.now()).toISOString(),
+      authStatus: "usable",
+      sourcesTried: sourceNames(attempts),
+    },
+    attempts,
+  };
+}
+
+/**
+ * `bl usage token-plan --output json` echoes only the vendor's usage fields
+ * when present, so a parsed object with no keys at all is the established
+ * shape of an authenticated account the vendor currently serves no usage data
+ * for. Anything nonempty that fails recognition stays malformed, never this.
+ */
+function isEstablishedEmptyAlibabaUsage(raw: unknown): boolean {
+  const root = objectValue(raw);
+  return root !== undefined && Object.keys(root).length === 0;
+}
+
+/**
+ * A failed `bl` invocation carries the vendor's structured error on stderr;
+ * prefer its `error.message` over the multi-line "Command failed" blob so
+ * every output surface states one clean fact. Only the observed session
+ * failure is classified as an auth verdict - anything else stays a failed
+ * read, never a sign-out.
+ */
+export function classifyBlFailure(error: unknown): {
+  error: string;
+  sessionExpired: boolean;
+} {
+  if (error instanceof SyntaxError)
+    return { error: "bl_usage_malformed_json", sessionExpired: false };
+  if (!(error instanceof Error))
+    return { error: "bl_usage_failed", sessionExpired: false };
+  const message = error.message.trim();
+  if (message === "bl_usage_malformed_json" || message === "bl_cli_unavailable")
+    return { error: message, sessionExpired: false };
+  const payload = parseBlErrorPayload(failureStderrText(error));
+  if (payload?.message) {
+    const sessionExpired =
+      payload.code === 3 || /not logged in/i.test(payload.message);
+    return {
+      error: sessionExpired
+        ? BL_ERROR_SESSION_EXPIRED
+        : `bl_usage_failed: ${payload.message.slice(0, 240)}`,
+      sessionExpired,
+    };
+  }
+  return {
+    error: message
+      ? `bl_usage_failed: ${message.slice(0, 240)}`
+      : "bl_usage_failed",
+    sessionExpired: false,
+  };
+}
+
+function parseBlErrorPayload(
+  stderr: unknown,
+): { code?: number; message?: string } | undefined {
+  const text =
+    typeof stderr === "string"
+      ? stderr
+      : Buffer.isBuffer(stderr)
+        ? stderr.toString("utf8")
+        : undefined;
+  if (!text?.trim()) return undefined;
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+  const payload = objectValue(objectValue(raw)?.error);
+  if (!payload) return undefined;
+  return {
+    code: numberValue(payload.code),
+    message: stringValue(payload.message),
+  };
+}
+
+/** The vendor error body `execFileText` preserved on the rejection. */
+function failureStderrText(error: Error): unknown {
+  const enriched = error as Error & {
+    commandStderr?: unknown;
+    stderr?: unknown;
+  };
+  return enriched.commandStderr ?? enriched.stderr;
 }
 
 async function inspectAuthWithDependencies(
@@ -378,14 +515,5 @@ function parseAlibabaReset(value: unknown): string | undefined {
 }
 
 function errorMessage(error: unknown): string {
-  if (error instanceof SyntaxError) return "bl_usage_malformed_json";
-  if (error instanceof Error) {
-    const message = error.message.trim();
-    if (message === "bl_usage_malformed_json") return message;
-    if (message === "bl_cli_unavailable") return message;
-    return message
-      ? `bl_usage_failed: ${message.slice(0, 240)}`
-      : "bl_usage_failed";
-  }
-  return "bl_usage_failed";
+  return classifyBlFailure(error).error;
 }

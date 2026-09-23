@@ -26,6 +26,12 @@ import {
 } from "./env-pi-credential.js";
 
 export const OPENROUTER_KEY_URL = "https://openrouter.ai/api/v1/key";
+/**
+ * OpenRouter's documented credits endpoint: the purchased total and the
+ * usage drawn against it are the account's real dollar budget, which is the
+ * figure to report when the key carries no spend cap.
+ */
+export const OPENROUTER_CREDITS_URL = "https://openrouter.ai/api/v1/credits";
 export const OPENROUTER_PI_SOURCE = "pi:openrouter";
 export const OPENROUTER_ENV_SOURCE = "env:OPENROUTER_API_KEY";
 
@@ -53,6 +59,11 @@ export type NormalizedOpenRouterPayload = {
   remaining?: number;
   period?: string;
   unlimited: boolean;
+};
+
+export type NormalizedOpenRouterCredits = {
+  purchased?: number;
+  used?: number;
 };
 
 export function resolveOpenRouterCredentials(
@@ -146,6 +157,15 @@ async function fetchQuota(dependencies: Dependencies): Promise<ProviderQuota> {
         }
       }
 
+      // A null spend cap means the key has no configured limit, not that the
+      // account holds unlimited credit, so it is never published as
+      // `unlimited`: the reported dollar amount is the spend cap's own
+      // remaining when one exists, else the purchased-credit balance.
+      const creditRemaining =
+        !normalized.unlimited && normalized.remaining !== undefined
+          ? normalized.remaining
+          : await readOpenRouterCreditsBalance(resolution.key, dependencies);
+
       return successProvider({
         provider: "openrouter",
         label: LABEL,
@@ -154,11 +174,9 @@ async function fetchQuota(dependencies: Dependencies): Promise<ProviderQuota> {
           ? { accountId: normalized.label, identityStatus: "unverified" }
           : undefined,
         windows,
-        ...(normalized.unlimited
-          ? { credits: { unlimited: true, unit: "usd" } }
-          : normalized.remaining !== undefined
-            ? { credits: { remaining: normalized.remaining, unit: "usd" } }
-            : {}),
+        ...(creditRemaining !== undefined
+          ? { credits: { remaining: creditRemaining, unit: "usd" } }
+          : {}),
         refreshedAt: new Date(dependencies.now()).toISOString(),
         sourcesTried: sourceNames(attempts),
         attempts,
@@ -241,6 +259,56 @@ export function normalizeOpenRouterPayload(
     period,
     unlimited,
   };
+}
+
+/**
+ * The documented response names the purchased total and the usage drawn
+ * against it; the vendor has served both the current
+ * `total_credits`/`total_usage` spellings and the documented
+ * `total_credits_purchased`/`total_credits_used` pair, so both are accepted.
+ */
+export function normalizeOpenRouterCredits(
+  raw: unknown,
+): NormalizedOpenRouterCredits {
+  const root = objectValue(raw);
+  const data = objectValue(root?.data) ?? root;
+  if (!data) throw new Error("invalid_payload");
+  const credits: NormalizedOpenRouterCredits = {
+    ...(asNonnegativeNumber(data.total_credits) !== undefined
+      ? { purchased: asNonnegativeNumber(data.total_credits) }
+      : asNonnegativeNumber(data.total_credits_purchased) !== undefined
+        ? { purchased: asNonnegativeNumber(data.total_credits_purchased) }
+        : {}),
+    ...(asNonnegativeNumber(data.total_usage) !== undefined
+      ? { used: asNonnegativeNumber(data.total_usage) }
+      : asNonnegativeNumber(data.total_credits_used) !== undefined
+        ? { used: asNonnegativeNumber(data.total_credits_used) }
+        : {}),
+  };
+  if (credits.purchased === undefined && credits.used === undefined)
+    throw new Error("invalid_payload");
+  return credits;
+}
+
+async function readOpenRouterCreditsBalance(
+  key: string,
+  dependencies: Pick<Dependencies, "fetch" | "deadlineMs">,
+): Promise<number | undefined> {
+  try {
+    const payload = await requestKeyEndpoint(
+      OPENROUTER_CREDITS_URL,
+      key,
+      dependencies.fetch,
+      dependencies.deadlineMs,
+    );
+    const credits = normalizeOpenRouterCredits(payload);
+    if (credits.purchased === undefined || credits.used === undefined)
+      return undefined;
+    // Clamp overage to zero without rounding away sub-cent credit.
+    return Math.max(0, credits.purchased - credits.used);
+  } catch {
+    return undefined;
+  }
 }
 
 function objectValue(value: unknown): Record<string, unknown> | undefined {
