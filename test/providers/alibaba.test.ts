@@ -379,6 +379,25 @@ describe("Alibaba bl usage provider", () => {
     expect(JSON.stringify(report)).not.toContain("Command failed");
   });
 
+  it("does not classify a non-session code by its login message", async () => {
+    installMockBlError(
+      join(tempDir, "args"),
+      JSON.stringify({
+        error: { code: 8, message: "Console session is not logged in" },
+      }),
+      8,
+    );
+    process.env.PATH = tempDir;
+
+    const report = await createAlibabaAdapter().fetchQuota(OPTIONS);
+
+    expect(report.state.status).not.toBe("auth_required");
+    expect(report.state.remedyCommand).toBeUndefined();
+    expect(report.state.error).toBe(
+      "bl_usage_failed: Console session is not logged in",
+    );
+  });
+
   it("states the vendor's structured error message instead of the command blob", async () => {
     const argsFile = join(tempDir, "args");
     installMockBlError(

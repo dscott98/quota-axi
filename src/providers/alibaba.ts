@@ -205,8 +205,7 @@ export function classifyBlFailure(error: unknown): {
     return { error: message, sessionExpired: false };
   const payload = parseBlErrorPayload(failureStderrText(error));
   if (payload?.message) {
-    const sessionExpired =
-      payload.code === 3 || /not logged in/i.test(payload.message);
+    const sessionExpired = payload.code === 3;
     return {
       error: sessionExpired
         ? BL_ERROR_SESSION_EXPIRED

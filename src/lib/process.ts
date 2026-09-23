@@ -11,7 +11,7 @@ export type ExecFileTextOptions = {
 /**
  * Run a command and resolve its stdout as text. On failure the rejection is
  * Node's own error (message preserved for existing consumers) enriched with
- * `commandStdout`/`commandStderr` from the callback outputs, so callers can
+ * `commandStderr` from the callback output, so callers can
  * parse vendor error bodies without relying on fields on Node's error or
  * extracting them from its combined command-failure message.
  */
@@ -50,10 +50,8 @@ export function execFileText(
       (error, stdout, stderr) => {
         if (error) {
           const enriched = error as Error & {
-            commandStdout?: string;
             commandStderr?: string;
           };
-          enriched.commandStdout = String(stdout ?? "");
           enriched.commandStderr = String(stderr ?? "");
           reject(enriched);
           return;

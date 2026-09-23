@@ -205,6 +205,9 @@ describe("OpenRouter provider", () => {
     expect(() =>
       normalizeOpenRouterCredits({ data: { unrelated: true } }),
     ).toThrow("invalid_payload");
+    expect(() =>
+      normalizeOpenRouterCredits({ total_credits: 25, total_usage: 10 }),
+    ).toThrow("invalid_payload");
   });
 
   it.each([9.996, 9.994])(
