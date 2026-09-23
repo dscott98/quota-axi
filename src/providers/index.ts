@@ -15,7 +15,6 @@ import { deepseekAdapter } from "./deepseek.js";
 import { openrouterAdapter } from "./openrouter.js";
 import { zaiAdapter } from "./zai.js";
 import {
-  DEFAULT_PROVIDER_IDS,
   PROVIDER_IDS,
   type ProviderAdapter,
   type ProviderId,
@@ -41,7 +40,7 @@ export const PROVIDERS: Record<ProviderId, ProviderAdapter> = {
 };
 
 export function parseProviders(value: string | undefined): ProviderId[] {
-  if (!value) return [...DEFAULT_PROVIDER_IDS];
+  if (!value) return [...PROVIDER_IDS];
   const providers = value
     .split(",")
     .map((item) => item.trim())

@@ -271,7 +271,7 @@ export function normalizeOpenRouterCredits(
   raw: unknown,
 ): NormalizedOpenRouterCredits {
   const root = objectValue(raw);
-  const data = objectValue(root?.data) ?? root;
+  const data = objectValue(root?.data);
   if (!data) throw new Error("invalid_payload");
   const credits: NormalizedOpenRouterCredits = {
     ...(asNonnegativeNumber(data.total_credits) !== undefined

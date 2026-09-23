@@ -23,3 +23,17 @@ process.env.GH_CONFIG_DIR = join(
   tmpdir(),
   `quota-axi-test-no-gh-config-${process.pid}-${randomUUID()}`,
 );
+
+// Native Copilot metadata must never come from the developer's real profile.
+process.env.COPILOT_HOME = join(
+  tmpdir(),
+  `quota-axi-test-no-copilot-config-${process.pid}-${randomUUID()}`,
+);
+
+// Quota snapshots must never land in the developer's real ~/.cache/quota-axi.
+// Commands such as `models` write the cache; without this, a suite run can
+// stamp a fixture into the live Claude slot under the machine's real context.
+process.env.XDG_CACHE_HOME = join(
+  tmpdir(),
+  `quota-axi-test-cache-${process.pid}-${randomUUID()}`,
+);

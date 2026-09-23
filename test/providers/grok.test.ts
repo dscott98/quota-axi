@@ -295,8 +295,8 @@ describe("Grok consumer quota parsing", () => {
     expect(result.windows).toEqual([
       {
         id: "credits",
-        label: "credits",
-        kind: "credits",
+        label: "week",
+        kind: "weekly",
         percentUsed: 18.25,
         percentRemaining: 81.75,
         startsAt: "2026-07-20T20:00:00.000Z",
@@ -305,7 +305,7 @@ describe("Grok consumer quota parsing", () => {
       {
         id: "product:grok_build",
         label: "Grok Build",
-        kind: "credits",
+        kind: "weekly",
         percentUsed: 33.25,
         percentRemaining: 66.75,
         startsAt: "2026-07-20T20:00:00.000Z",
@@ -314,7 +314,7 @@ describe("Grok consumer quota parsing", () => {
       {
         id: "product:chat",
         label: "Chat",
-        kind: "credits",
+        kind: "weekly",
         percentUsed: 100,
         percentRemaining: 0,
         startsAt: "2026-07-20T20:00:00.000Z",
@@ -364,6 +364,50 @@ describe("Grok consumer quota parsing", () => {
     expect(result.credits).toEqual({ remaining: 0, unit: "credits" });
   });
 
+  it("pins pre-existing behaviour: prepaid zero never bounds a live weekly window, whose kind and label come from the period", () => {
+    const result = normalizeGrokConsumerPayload(
+      consumerPayload({
+        percentUsed: 64,
+        products: [{ product: 2, usagePercent: 64 }],
+        prepaid: 0,
+      }),
+    );
+    const report = withQuotaSemantics(
+      {
+        provider: "grok",
+        label: "Grok",
+        source: "web",
+        ...result,
+        state: {
+          status: "fresh",
+          stale: false,
+          refreshedAt: result.refreshedAt,
+          sourcesTried: ["web"],
+        },
+      },
+      "2026-07-23T07:05:00.000Z",
+    );
+
+    expect(result.windows).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "credits",
+          label: "week",
+          kind: "weekly",
+        }),
+        expect.objectContaining({ id: "product:grok_build", kind: "weekly" }),
+      ]),
+    );
+    expect(result.credits).toEqual({ remaining: 0, unit: "credits" });
+    expect(report.quotaSemantics?.effectiveAvailability).toContainEqual(
+      expect.objectContaining({
+        scope: "all_products",
+        status: "known",
+        effectivePercentRemaining: 36,
+      }),
+    );
+  });
+
   it("supports monthly periods and unknown product enum values", () => {
     const result = normalizeGrokConsumerPayload(
       consumerPayload({
@@ -375,6 +419,7 @@ describe("Grok consumer quota parsing", () => {
     expect(result.windows[1]).toMatchObject({
       id: "product:unknown_99",
       label: "Product 99",
+      kind: "monthly",
       percentUsed: 12.5,
     });
   });
@@ -2872,6 +2917,8 @@ describe("Grok CLI rendering regression", () => {
       windows: [
         {
           id: "credits",
+          label: "week",
+          kind: "weekly",
           percentUsed: 0,
           percentRemaining: 100,
         },
@@ -2879,8 +2926,8 @@ describe("Grok CLI rendering regression", () => {
     });
 
     const toon = await captureCli(["--provider", "grok", "--full"]);
-    expect(toon).toContain("grok,credits,credits,100");
-    expect(toon).not.toContain("grok,credits,credits,unknown");
+    expect(toon).toContain("grok,credits,week,100");
+    expect(toon).not.toContain("grok,credits,week,unknown");
     expect(await captureCli(["--provider", "grok"])).toContain(
       "grok,all_products,100",
     );

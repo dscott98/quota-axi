@@ -10,6 +10,7 @@ import {
   readCachedProvider as readCachedProviderFromDisk,
 } from "../cache.js";
 import { readJsonFileResult, type JsonFileReadResult } from "../lib/fs.js";
+import { providerFetch } from "../lib/http.js";
 import { resolvePiAuthFilePath } from "../lib/pi-agent-dir.js";
 import { classifyPiAuthEntry } from "../lib/pi-auth-store.js";
 import { usableLiteralSecret } from "../lib/secret.js";
@@ -37,6 +38,9 @@ const OPENCODE_AUTH_SOURCE = "opencode:auth.json";
 const PI_ZAI_SOURCE = "pi:zai";
 const PI_ZAI_PROVIDER_ID = "zai";
 const USER_AGENT = `quota-axi/${VERSION}`;
+
+const zaiProviderFetch: typeof globalThis.fetch = (input, init) =>
+  providerFetch(input, init, { retryOverIpv4: true });
 
 const ZAI_PROVIDER_IDS = ["zai-coding-plan", "zai", "z-ai", "z.ai"];
 const ZHIPU_PROVIDER_IDS = ["zhipu", "zhipuai"];
@@ -195,7 +199,7 @@ export function createZaiAdapter(
 ): ProviderAdapter {
   const dependencies: ZaiDependencies = {
     credentialSources: defaultZaiCredentialSources(),
-    fetch: globalThis.fetch,
+    fetch: zaiProviderFetch,
     readCachedProvider: readCachedProviderFromDisk,
     deleteCachedProvider: deleteCachedProviderFromDisk,
     now: Date.now,
@@ -502,7 +506,7 @@ async function requestZaiQuota(
       fetchImplementation(`https://${host}${ZAI_QUOTA_PATH}`, {
         method: "GET",
         headers: {
-          Authorization: apiKey,
+          Authorization: `Bearer ${apiKey}`,
           Accept: "application/json",
           "Accept-Language": "en-US,en",
           "User-Agent": USER_AGENT,

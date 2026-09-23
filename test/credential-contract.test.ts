@@ -105,6 +105,7 @@ const ENV_KEYS = [
   "GH_CONFIG_DIR",
   "ELEVENLABS_API_KEY",
   "QUOTA_AXI_OPENCODE_GO_PI_AUTH",
+  "COPILOT_HOME",
 ] as const;
 
 const originalEnv = Object.fromEntries(
@@ -134,6 +135,7 @@ beforeEach(() => {
   // OpenCode Go reads its Pi store only behind this opt-in; the contract here
   // exercises that real file-to-adapter path.
   process.env.QUOTA_AXI_OPENCODE_GO_PI_AUTH = "1";
+  process.env.COPILOT_HOME = join(tempDir, "copilot");
   delete process.env.GROK_AUTH;
   delete process.env.GROK_AUTH_JSON;
   delete process.env.GROK_AUTH_PATH;
@@ -148,6 +150,7 @@ beforeEach(() => {
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.doUnmock("../src/lib/process.js");
+  vi.doUnmock("../src/providers/copilot-cli-credential.js");
   vi.resetModules();
   for (const key of ENV_KEYS) {
     const value = originalEnv[key];
@@ -239,13 +242,72 @@ describe("credential source contract", { timeout: 30_000 }, () => {
   });
 
   /**
-   * GitHub Copilot has two independent stores and no stored expiry: Copilot's
-   * own `apps.json`, then the GitHub CLI login. Neither ever reads as absent
-   * once it holds something, and no readable token is skipped before a
-   * sign-in verdict.
+   * Copilot source ordering and unsupported-storage verdicts are documented
+   * in README Provider notes. Present but unusable stores must remain visible
+   * when a sibling source answers.
    */
   describe("copilot", () => {
-    const copilotSources = ["apps-json", "gh:hosts.yml"];
+    it.each([
+      "credential_not_found",
+      "credential_logon_session_unavailable",
+      "credential_binding_mismatch",
+    ] as const)("keeps Windows %s visible when gh answers", async (reason) => {
+      const dir = join(tempDir, ".copilot");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(
+        join(dir, "config.json"),
+        JSON.stringify({
+          lastLoggedInUser: {
+            host: "https://github.com",
+            login: "synthetic-user",
+          },
+        }),
+      );
+      vi.doMock(
+        "../src/providers/copilot-cli-credential.js",
+        async (importOriginal) => {
+          const native =
+            await importOriginal<
+              typeof import("../src/providers/copilot-cli-credential.js")
+            >();
+          return {
+            ...native,
+            resolveCopilotCliCredential: (
+              options: Parameters<typeof native.resolveCopilotCliCredential>[0],
+              presenceOnly: boolean,
+            ) =>
+              native.resolveCopilotCliCredential(options, presenceOnly, {
+                platform: "win32",
+                environment: {},
+                homeDirectory: () => tempDir,
+                hasGrant: () => true,
+                readWindows: async () => ({ status: "unavailable", reason }),
+              }),
+          };
+        },
+      );
+      writeGhHosts("github.com:\n  oauth_token: gho_synthetic\n");
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(
+          async () =>
+            new Response(JSON.stringify({ copilot_plan: "individual" })),
+        ),
+      );
+      const result = await readQuota("copilot");
+      expect(result.state.status).toBe("fresh");
+      expect(attemptsFor(result, "copilot-cli:keychain")[0]).toMatchObject({
+        error: reason,
+        credentialPresent: true,
+      });
+      expect(attemptsFor(result, "gh:hosts.yml")[0].status).toBe("success");
+    });
+
+    const copilotSources = [
+      "apps-json",
+      "copilot-cli:keychain",
+      "gh:hosts.yml",
+    ];
 
     function writeAppsJson(text: string): void {
       const path = process.env.GITHUB_COPILOT_APPS_JSON!;
@@ -315,6 +377,38 @@ describe("credential source contract", { timeout: 30_000 }, () => {
           expect(attempt.credentialPresent).toBe(true);
         }
         expect(result.state.status).toBe("auth_required");
+      },
+    );
+
+    it.each([
+      "{invalid",
+      JSON.stringify({
+        lastLoggedInUser: {
+          host: "https://github.com",
+          login: "synthetic-user",
+        },
+      }),
+    ])(
+      "keeps a present unsupported native source visible when a sibling answers",
+      async (text) => {
+        const dir = process.env.COPILOT_HOME!;
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(join(dir, "config.json"), text);
+        writeGhHosts("github.com:\n  oauth_token: gho_synthetic\n");
+        vi.stubGlobal(
+          "fetch",
+          vi.fn(
+            async () =>
+              new Response(JSON.stringify({ copilot_plan: "individual" })),
+          ),
+        );
+        const result = await readQuota("copilot");
+        expect(result.state.status).toBe("fresh");
+        const attempt = attemptsFor(result, "copilot-cli:keychain")[0];
+        expect(attempt.status).toBe("skipped");
+        expect(
+          attempt.credentialPresent === true || attempt.degraded === false,
+        ).toBe(true);
       },
     );
 

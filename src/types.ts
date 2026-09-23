@@ -35,10 +35,6 @@ export const PROVIDER_IDS = [
   "elevenlabs",
 ] as const satisfies readonly ProviderId[];
 
-export const DEFAULT_PROVIDER_IDS = PROVIDER_IDS.filter(
-  (provider) => provider !== "minimax",
-);
-
 export type ProviderSource =
   | "oauth"
   | "pi:openai-codex"
@@ -358,6 +354,23 @@ export type ProviderOptions = {
 export type ProviderAdapter = {
   id: ProviderId;
   label: string;
+  /**
+   * Credential sources that can hold a credential without showing the user
+   * has this provider, such as Copilot's GitHub CLI fallback. A skip there,
+   * or a request through it that was definitively refused, is not evidence
+   * of use when the human report folds providers that are not set up; a
+   * request through it that failed transiently still is.
+   */
+  incidentalSources?: readonly string[];
+  /**
+   * Whether a skipped attempt this adapter recorded left presence unknown
+   * rather than showing the source genuinely absent, such as a configuration
+   * naming no confirmable account or an installed tool that failed. The
+   * adapter that owns the source is the only thing that can read its own
+   * skips, so it decides here instead of the human report guessing from
+   * error wording. A provider with such a skip is never folded as not set up.
+   */
+  isUncertainSkip?(attempt: SourceAttempt): boolean;
   discoverAccounts?(): Promise<ProviderAccount[] | undefined>;
   fetchQuota(options: ProviderOptions): Promise<ProviderQuota>;
   inspectAuth(options: ProviderOptions): Promise<AuthProviderReport>;

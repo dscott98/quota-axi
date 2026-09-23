@@ -16,8 +16,7 @@ export function percentRemaining(
 
 export function parseEpochOrIso(value: unknown): string | undefined {
   if (typeof value === "number" && Number.isFinite(value)) {
-    const date = new Date(value * 1000);
-    return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
+    return new Date(value * 1000).toISOString();
   }
   if (typeof value === "string" && value.trim() !== "") {
     const date = new Date(value);

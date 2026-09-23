@@ -863,14 +863,25 @@ export function normalizeGrokConsumerPayload(
     periodStart !== undefined &&
     resetsAt !== undefined;
 
+  const windowKind =
+    periodType === "weekly" || periodType === "monthly"
+      ? periodType
+      : "credits";
+  const windowLabel =
+    periodType === "weekly"
+      ? "week"
+      : periodType === "monthly"
+        ? "month"
+        : "credits";
+
   const windows: QuotaWindow[] = [];
   const sharedExplicit = floatAt(config, 1);
   if (sharedExplicit !== undefined || validCurrentPeriod) {
     const percentUsed = clampExactPercent(sharedExplicit ?? 0);
     windows.push({
       id: "credits",
-      label: "credits",
-      kind: "credits",
+      label: windowLabel,
+      kind: windowKind,
       percentUsed,
       percentRemaining: 100 - percentUsed,
       ...(periodStart ? { startsAt: periodStart } : {}),
@@ -892,7 +903,7 @@ export function normalizeGrokConsumerPayload(
     windows.push({
       id: `product:${productName.id}`,
       label: productName.label,
-      kind: "credits",
+      kind: windowKind,
       percentUsed,
       percentRemaining: 100 - percentUsed,
       ...(periodStart ? { startsAt: periodStart } : {}),

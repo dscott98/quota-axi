@@ -15,6 +15,29 @@ type ProxyTransport = {
   fetch: typeof import("undici").fetch;
 };
 
+export type ProviderFetchNetworkOptions = {
+  /**
+   * Retry a direct request over IPv4 once when the host's default dual-stack
+   * attempt fails to connect, for providers that advertise an IPv6 route this
+   * host cannot reach.
+   */
+  retryOverIpv4?: boolean;
+};
+
+/**
+ * Failures to reach the host at all, either from the OS socket layer or from
+ * undici's own connect timeout. A refused connection means a peer answered, so
+ * it is not one of these, and neither is a failure after the request is on the
+ * wire; both would fail the same way over IPv4.
+ */
+const CONNECT_FAILURE_CODES = new Set([
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "EADDRNOTAVAIL",
+  "ETIMEDOUT",
+  "UND_ERR_CONNECT_TIMEOUT",
+]);
+
 const PROXY_TRANSPORTS = Symbol.for("quota-axi.proxy-transports");
 const sharedGlobals = globalThis as unknown as Record<symbol, unknown>;
 const proxyTransports =
@@ -22,6 +45,8 @@ const proxyTransports =
     | Map<string, Promise<ProxyTransport>>
     | undefined) ?? new Map<string, Promise<ProxyTransport>>();
 sharedGlobals[PROXY_TRANSPORTS] = proxyTransports;
+
+const IPV4_TRANSPORT = Symbol.for("quota-axi.ipv4-transport");
 
 function requestUrl(input: string | URL | Request): string {
   if (typeof input === "string") return input;
@@ -43,17 +68,60 @@ function configuredProxyTransport(
   return transport;
 }
 
+function ipv4Transport(): Promise<ProxyTransport> {
+  const existing = sharedGlobals[IPV4_TRANSPORT] as
+    | Promise<ProxyTransport>
+    | undefined;
+  if (existing) return existing;
+  const transport = import("undici").then(({ Agent, fetch }) => ({
+    // Undici passes this partial net.connect option through at runtime, but its
+    // intersection type incorrectly requires the destination port here.
+    dispatcher: new Agent({ connect: { family: 4 } as never }),
+    fetch,
+  }));
+  sharedGlobals[IPV4_TRANSPORT] = transport;
+  return transport;
+}
+
+function isConnectFailure(error: unknown, depth = 0): boolean {
+  if (depth > 4 || !(error instanceof Error)) return false;
+  const { code } = error as NodeJS.ErrnoException;
+  if (code !== undefined && CONNECT_FAILURE_CODES.has(code)) return true;
+  if (
+    error instanceof AggregateError &&
+    error.errors.some((nested) => isConnectFailure(nested, depth + 1))
+  )
+    return true;
+  return isConnectFailure(error.cause, depth + 1);
+}
+
 /** Fetch through the host's standard proxy environment when one is configured. */
 export async function providerFetch(
   input: string | URL | Request,
   init: RequestInit = {},
+  network: ProviderFetchNetworkOptions = {},
 ): Promise<Response> {
-  const transport = await configuredProxyTransport(input);
-  if (!transport) return fetch(input, init);
-  const { fetch: proxiedFetch, dispatcher } = transport;
-  const response = await proxiedFetch(
-    input as Parameters<typeof proxiedFetch>[0],
-    { ...init, dispatcher } as Parameters<typeof proxiedFetch>[1],
+  const configured = configuredProxyTransport(input);
+  if (!configured) {
+    if (!network.retryOverIpv4) return fetch(input, init);
+    try {
+      return await fetch(input, init);
+    } catch (error) {
+      if (!isConnectFailure(error)) throw error;
+      return await dispatchedFetch(await ipv4Transport(), input, init);
+    }
+  }
+  return dispatchedFetch(await configured, input, init);
+}
+
+async function dispatchedFetch(
+  { fetch: transportFetch, dispatcher }: ProxyTransport,
+  input: string | URL | Request,
+  init: RequestInit,
+): Promise<Response> {
+  const response = await transportFetch(
+    input as Parameters<typeof transportFetch>[0],
+    { ...init, dispatcher } as Parameters<typeof transportFetch>[1],
   );
   // The compiler keeps undici's declared Response and the global one apart
   // because undici-types lags its own implementation, but the surface provider

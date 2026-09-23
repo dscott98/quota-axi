@@ -6,10 +6,12 @@ import {
   renderTuiHintLine,
   shortWindowLabel,
   thinBar,
-  windowLabelColumnWidth,
 } from "../src/tui.js";
 import { withQuotaSemantics } from "../src/interpretation.js";
-import type { ProviderQuota } from "../src/types.js";
+import { providerPresence } from "../src/lib/source-attempts.js";
+import { redactedResponse } from "../src/render.js";
+import { PROVIDER_IDS } from "../src/types.js";
+import type { ProviderQuota, QuotaAxiResponse } from "../src/types.js";
 import {
   claudeProvider,
   codexProvider,
@@ -82,7 +84,7 @@ describe("renderQuotaTui structure", () => {
   it("summarizes the fleet in the dim header with local time", () => {
     const lines = render();
     expect(lines[0]).toBe(
-      "  quota-axi · 2026-08-06 16:21 PDT · 3 live · 3 signed out",
+      "  quota-axi · 2026-08-06 16:21 PDT · 3 live · 3 need attention · 0 not set up",
     );
   });
 
@@ -186,8 +188,7 @@ describe("renderQuotaTui structure", () => {
       // marker from their mapped window's reset clock (19.7%), not the other
       // window's runway projection.
       expect(headlineBar).toContain(barText(thinBar(84, 19.7, 41)));
-      // 22-cell bar minus the label column's one-cell gutter.
-      expect(mappedRow).toContain(barText(thinBar(84, 19.7, 21)));
+      expect(mappedRow).toContain(barText(thinBar(84, 19.7, 22)));
     }
   });
 
@@ -836,91 +837,6 @@ describe("cards for providers with no combinable bound", () => {
   );
 });
 
-describe("per-model window rows without a combined bound", () => {
-  const minimax = withQuotaSemantics(
-    {
-      provider: "minimax",
-      label: "MiniMax",
-      source: "api",
-      windows: [
-        {
-          id: "model:general:interval",
-          label: "general interval",
-          kind: "session",
-          percentUsed: 0,
-          percentRemaining: 100,
-          resetsAt: "2026-08-07T00:00:00.000Z",
-        },
-        {
-          id: "model:general:weekly",
-          label: "general weekly",
-          kind: "weekly",
-          percentUsed: 7,
-          percentRemaining: 93,
-          resetsAt: "2026-08-07T00:00:00.000Z",
-        },
-        {
-          id: "model:video:interval",
-          label: "video interval",
-          kind: "session",
-          percentUsed: 0,
-          percentRemaining: 100,
-          resetsAt: "2026-08-07T00:00:00.000Z",
-        },
-        {
-          id: "model:video:weekly",
-          label: "video weekly",
-          kind: "weekly",
-          percentUsed: 0,
-          percentRemaining: 100,
-          resetsAt: "2026-08-07T00:00:00.000Z",
-        },
-      ],
-      state: { status: "fresh", stale: false, sourcesTried: ["api"] },
-    },
-    GENERATED_AT,
-  );
-  const lines = renderQuotaTui(
-    { generatedAt: GENERATED_AT, schemaVersion: 5, providers: [minimax] },
-    { timeZone: "America/Los_Angeles" },
-  ).split("\n");
-
-  it("spells all four vendor meters out instead of truncating them to identical ellipses", () => {
-    for (const label of [
-      "general interval",
-      "general weekly",
-      "video interval",
-      "video weekly",
-    ]) {
-      const line = findLine(lines, `│   ${label}`);
-      expect(line, `${label} keeps a gutter before its bar`).toContain(
-        `${label} `,
-      );
-      expect(
-        stripAnsi(line),
-        `${label} row stays inside the card`,
-      ).toHaveLength(CARD_COLUMNS);
-      expect(line).toMatch(/[━─]/);
-    }
-    expect(findLine(lines, "general weekly")).toContain(" 93%");
-    expect(findLine(lines, "general interval")).toContain("100%");
-    // A fixed 8-cell column rendered all four rows as "genera…" or "video …".
-    expect(lines.join("\n")).not.toContain("genera…");
-  });
-
-  it("derives the label column from the card's own labels", () => {
-    expect(windowLabelColumnWidth(minimax.windows)).toBe(16);
-    expect(
-      windowLabelColumnWidth([
-        { id: "five_hour", label: "session", kind: "session" },
-        { id: "seven_day", label: "week", kind: "weekly" },
-      ]),
-    ).toBe(8);
-    expect(shortWindowLabel(minimax.windows[0]!)).toBe("general interval");
-    expect(shortWindowLabel(minimax.windows[0]!, 8)).toBe("general…");
-  });
-});
-
 describe("used-share window rows", () => {
   it("prints percentUsed of the parent instead of a remaining bar or ?", () => {
     const kimi = withQuotaSemantics(
@@ -1180,5 +1096,249 @@ describe("color handling", () => {
     expect(
       detectTuiColorDepth({ FORCE_COLOR: "0", COLORTERM: "truecolor" }, false),
     ).toBe("none");
+  });
+});
+
+describe("providers that are not set up", () => {
+  function notSetUp(
+    provider: ProviderQuota["provider"],
+    sources: string[] = [`env:${provider.toUpperCase()}_API_KEY`],
+  ): ProviderQuota {
+    return {
+      provider,
+      label: provider,
+      source: "unavailable",
+      windows: [],
+      state: {
+        status: "auth_required",
+        stale: false,
+        error: `${provider}_credential_unavailable`,
+        sourcesTried: sources,
+      },
+      attempts: sources.map((source) => ({
+        source,
+        status: "skipped",
+        error: "credentials_missing",
+      })),
+    };
+  }
+
+  function brokenKimi(): ProviderQuota {
+    return {
+      provider: "kimi",
+      label: "Kimi",
+      source: "unavailable",
+      windows: [],
+      state: {
+        status: "error",
+        stale: false,
+        error: "schema_invalid",
+        sourcesTried: ["pi:kimi-coding"],
+      },
+      attempts: [
+        { source: "pi:kimi-coding", status: "failed", error: "schema_invalid" },
+      ],
+    };
+  }
+
+  /** Declaration order interleaves every tier on purpose. */
+  function fleet(): QuotaAxiResponse {
+    return {
+      generatedAt: GENERATED_AT,
+      schemaVersion: 5,
+      providers: [
+        notSetUp("zai", ["pi:zai", "opencode:auth.json"]),
+        claudeProvider(),
+        notSetUp("agy", ["cli", "loopback"]),
+        brokenKimi(),
+        codexProvider(),
+        notSetUp("alibaba", ["bl-cli"]),
+        notSetUp("opencode-go", ["opencode:auth.json"]),
+        notSetUp("commandcode"),
+        notSetUp("minimax"),
+        notSetUp("mimo"),
+        notSetUp("deepseek"),
+        notSetUp("openrouter"),
+        notSetUp("elevenlabs"),
+      ],
+    };
+  }
+
+  function frame(
+    response: QuotaAxiResponse,
+    options: Parameters<typeof renderQuotaTui>[1] = {},
+  ): string[] {
+    return renderQuotaTui(response, {
+      timeZone: "America/Los_Angeles",
+      ...options,
+    }).split("\n");
+  }
+
+  it("folds them into one footer line after the live and broken cards", () => {
+    const lines = frame(fleet());
+
+    expect(lines[0]).toBe(
+      "  quota-axi · 2026-08-06 16:21 PDT · 2 live · 1 needs attention · 10 not set up",
+    );
+    expect(findLine(lines, "● claude")).toMatch(/● claude .*● codex /);
+    const kimi = lines.findIndex((line) => line.includes("○ kimi"));
+    const footer = lines.findIndex((line) => line.includes("○ not set up"));
+    expect(kimi).toBeGreaterThan(lines.findIndex((l) => l.includes("● codex")));
+    expect(footer).toBeGreaterThan(kimi);
+    expect(lines.slice(footer)).toEqual([
+      "  ○ not set up  zai · agy · alibaba · opencode-go · commandcode · minimax · mimo · deepseek",
+      "                openrouter · elevenlabs   quota-axi auth shows where each is read",
+    ]);
+    // No card is drawn for a provider that is not set up.
+    expect(lines.join("\n")).not.toMatch(/╭─ ○ (zai|agy|mimo|elevenlabs) /);
+  });
+
+  it("wraps the footer under a hanging indent in a narrow terminal", () => {
+    const lines = frame(fleet(), { columns: 80 });
+    const footer = lines.findIndex((line) => line.includes("○ not set up"));
+
+    expect(lines.slice(footer)).toEqual([
+      "  ○ not set up  zai · agy · alibaba · opencode-go · commandcode · minimax",
+      "                mimo · deepseek · openrouter · elevenlabs",
+      "                quota-axi auth shows where each is read",
+    ]);
+    for (const line of lines)
+      expect(displayColumns(line)).toBeLessThanOrEqual(80);
+  });
+
+  it("draws them as full cards below a label when asked", () => {
+    const lines = frame(fleet(), { showNotSetUp: true });
+    const label = lines.indexOf("  ○ not set up · 10");
+
+    expect(label).toBeGreaterThan(lines.findIndex((l) => l.includes("○ kimi")));
+    expect(lines[label + 1]).toBe("");
+    // The expanded group starts its own row rather than pairing with kimi.
+    expect(lines[label + 2]).toMatch(/^╭─ ○ zai ─+ signed out ─╮ {2}╭─ ○ agy /);
+    expect(lines.slice(label)).toContainEqual(
+      expect.stringContaining("elevenlabs credential unavailable"),
+    );
+    expect(lines.join("\n")).not.toContain("quota-axi auth shows where");
+    expect(lines[0]).toContain("2 live · 1 needs attention · 10 not set up");
+  });
+
+  it("takes presence from the caller, since redaction removes the attempts", () => {
+    const complete = fleet();
+    const redacted = redactedResponse(complete, false);
+
+    // Without attempts nothing proves absence, so nothing folds.
+    expect(frame(redacted)[0]).toContain("2 live · 11 need attention");
+    expect(frame(redacted).join("\n")).toContain("╭─ ○ zai ");
+
+    const presence = complete.providers.map((provider) =>
+      providerPresence(provider),
+    );
+    const lines = frame(redacted, { presence });
+    expect(lines[0]).toContain("2 live · 1 needs attention · 10 not set up");
+    expect(lines.join("\n")).not.toContain("╭─ ○ zai ");
+  });
+
+  it("renders only the header and the footer when nothing is set up", () => {
+    const response: QuotaAxiResponse = {
+      generatedAt: GENERATED_AT,
+      schemaVersion: 5,
+      providers: [notSetUp("zai"), notSetUp("mimo"), notSetUp("deepseek")],
+    };
+
+    expect(frame(response)).toEqual([
+      "  quota-axi · 2026-08-06 16:21 PDT · 0 live · 0 need attention · 3 not set up",
+      "",
+      "  ○ not set up  zai · mimo · deepseek   quota-axi auth shows where each is read",
+    ]);
+
+    const expanded = frame(response, { showNotSetUp: true });
+    expect(expanded.slice(0, 4)).toEqual([
+      "  quota-axi · 2026-08-06 16:21 PDT · 0 live · 0 need attention · 3 not set up",
+      "",
+      "  ○ not set up · 3",
+      "",
+    ]);
+    expect(expanded[4]).toMatch(/^╭─ ○ zai .*╭─ ○ mimo /);
+  });
+
+  it("gives up the timestamp before a tier count in a narrow terminal", () => {
+    const response: QuotaAxiResponse = {
+      generatedAt: GENERATED_AT,
+      schemaVersion: 5,
+      providers: PROVIDER_IDS.map((provider) => notSetUp(provider)),
+    };
+    const zone = { timeZone: "Australia/Adelaide" };
+    const wide = frame(response, { ...zone, columns: 120 });
+    const narrow = frame(response, { ...zone, columns: 80 });
+
+    // The unabridged header does not fit the narrowest supported terminal.
+    expect(displayColumns(wide[0])).toBeGreaterThan(80);
+    expect(displayColumns(narrow[0])).toBeLessThanOrEqual(80);
+    // The time zone is spent to make room; every count survives.
+    expect(narrow[0]).toMatch(
+      new RegExp(
+        `^ {2}quota-axi · \\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2} · 0 live · 0 need attention · ${PROVIDER_IDS.length} not set up$`,
+      ),
+    );
+  });
+
+  it("names every tier in the header, including the ones that are empty", () => {
+    const lines = frame({
+      generatedAt: GENERATED_AT,
+      schemaVersion: 5,
+      providers: [claudeProvider(), codexProvider()],
+    });
+
+    expect(lines[0]).toBe(
+      "  quota-axi · 2026-08-06 16:21 PDT · 2 live · 0 need attention · 0 not set up",
+    );
+  });
+
+  it("names a folded account lane by provider and account key", () => {
+    const work = { ...notSetUp("codex"), accountKey: "openai-codex-work" };
+    const lane = { ...notSetUp("zai"), accountKey: "default" };
+    const lines = frame({
+      generatedAt: GENERATED_AT,
+      schemaVersion: 6,
+      providers: [work, lane],
+    });
+
+    expect(findLine(lines, "○ not set up")).toContain(
+      "codex/openai-codex-work · zai ",
+    );
+  });
+
+  it("truncates a folded name too long for the footer instead of overflowing", () => {
+    const long = {
+      ...notSetUp("codex"),
+      accountKey: `openai-codex-${"w".repeat(80)}`,
+    };
+    const lines = frame(
+      {
+        generatedAt: GENERATED_AT,
+        schemaVersion: 6,
+        providers: [long, notSetUp("zai")],
+      },
+      { columns: 80 },
+    );
+    const footer = lines.findIndex((line) => line.includes("○ not set up"));
+
+    for (const line of lines.slice(footer)) {
+      expect(displayColumns(line)).toBeLessThanOrEqual(80);
+    }
+    // The label never stands alone: the first name shares its line, cut to fit.
+    expect(lines[footer]).toMatch(
+      /^ {2}○ not set up {2}codex\/openai-codex-w+…$/,
+    );
+    expect(lines.slice(footer + 1)).toEqual([
+      "                zai   quota-axi auth shows where each is read",
+    ]);
+  });
+
+  it("keeps the --full source footers for folded providers", () => {
+    const lines = frame(fleet(), { full: true });
+
+    expect(findLine(lines, "  alibaba · tried")).toContain(
+      "bl-cli (skipped: credentials_missing)",
+    );
   });
 });
